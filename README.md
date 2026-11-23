@@ -490,8 +490,10 @@ agent's build never makes another agent's hook pass through.
 
 Why Start does not rebuild: Proxmox holds the CT's config lock
 (`/run/lock/lxc/pve-config-<CTID>.lock`) for the whole Start task,
-including the pre-start hook, so the hook cannot destroy or recreate the
-CT — it would wait on its own task and time out. The rebuild therefore
+including the pre-start **and post-start** hooks, so the hooks cannot
+destroy, recreate, or `pct push` into the CT — each would wait on its own
+task and time out. (Provisioning therefore copies files in through
+`pct exec`, which does not take that lock.) The rebuild therefore
 happens at Stop: every Stop / `down` leaves a freshly built stub and
 records that it has never booted (`/root/.ai-sandbox/<agent>/pristine-stub`).
 Start only boots a stub carrying that record and clears it as it boots.
@@ -707,6 +709,9 @@ PVE hookscript.)
   reservation for the agent's MAC.
 - GUI Start finishes but no ssh line in the task log — the post-start
   hook found no IP or provisioning failed; read the task log above it.
+  Proxmox marks the Start task `OK` even when post-start fails, so the
+  `mistral sandbox ready via GUI` line (not the green tick) is the proof.
+  `vibe: command not found` inside the sandbox is the same symptom.
 - GUI Start fails with `pre-start: CT <id> is not a fresh stub` — the CT
   has booted since it was built (for example the host went down while
   the sandbox was running) and was never parked. Run

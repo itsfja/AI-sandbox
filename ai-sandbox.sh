@@ -92,7 +92,7 @@ profile_exists()   { valid_agent_name "$1" && declare -F "profile_${1}_meta" >/d
 # instance defaults. Called once per run, before any instance operation.
 select_agent() {   # $1 = agent (may be empty: falls back to $AGENT)
   AGENT="${1:-${AGENT:-}}"
-  [ -n "$AGENT" ] || die "no agent given — usage: $0 <command> <agent>; known agents: $(list_profiles)"
+  [ -n "$AGENT" ] || die "no agent given - usage: $0 <command> <agent>; known agents: $(list_profiles)"
   profile_exists "$AGENT" || die "unknown agent '$AGENT'; known agents: $(list_profiles)"
   load_config_file "${STATE_DIR}/${AGENT}/config.env"
   load_config_file "${STATE_DIR}/config.env"
@@ -133,7 +133,7 @@ apply_defaults() {
   CT_MAC="${CT_MAC:-}"                 # optional override; empty = managed MAC
   SECRETS_FILE="${SECRETS_FILE:-${INSTANCE_DIR}/secrets.env}"
   HOOK="${HOOK:-on}"                   # on = attach PVE hookscript (GUI trap)
-  CLOBBER="${CLOBBER:-discard}"        # discard | zero | off — post-stop rootfs wipe
+  CLOBBER="${CLOBBER:-discard}"        # discard | zero | off - post-stop rootfs wipe
   EXPORT_DIR="${EXPORT_DIR:-/root/ai-sandbox-export/${AGENT}}"
   LOCK_FILE="/run/lock/ai-sandbox.${AGENT}.lock"
   GUARD_STAMP="/run/lock/ai-sandbox.${AGENT}.workguard-ok"
@@ -234,7 +234,7 @@ hook_lock() {   # $1 = phase; rc 0 = lock acquired (do the work), rc 1 = passthr
   if flock -n 9; then
     return 0
   fi
-  echo "ai-sandbox: $AGENT operation in progress — $1 hook passthrough" >&2
+  echo "ai-sandbox: $AGENT operation in progress - $1 hook passthrough" >&2
   return 1
 }
 
@@ -276,10 +276,10 @@ self_check() {   # "$@" = full original argv; installs + re-execs once if stale
   [ "$AUTO_UPDATE" = "on" ] || return 0
   [ -z "${AI_SANDBOX_SELF_UPDATED:-}" ] || return 0
   local tmp bak
-  tmp="$(mktemp 2>/dev/null)" || { echo "self-check: mktemp failed — skipping" >&2; return 0; }
+  tmp="$(mktemp 2>/dev/null)" || { echo "self-check: mktemp failed - skipping" >&2; return 0; }
   if ! fetch_current_script "$tmp" 15; then
     rm -f "$tmp"
-    echo "self-check: could not fetch/validate $RAW_URL — continuing with the current script" >&2
+    echo "self-check: could not fetch/validate $RAW_URL - continuing with the current script" >&2
     return 0
   fi
   if [ "$(sha256sum "$(readlink -f "$0")" | awk '{print $1}')" = "$(sha256sum "$tmp" | awk '{print $1}')" ]; then
@@ -287,7 +287,7 @@ self_check() {   # "$@" = full original argv; installs + re-execs once if stale
     return 0
   fi
   bak="$(install_current_script "$tmp")"
-  echo "self-update: local script was stale — installed the current copy from main"
+  echo "self-update: local script was stale - installed the current copy from main"
   echo "  (previous copy: $bak); re-running on the new script"
   export AI_SANDBOX_SELF_UPDATED=1
   exec "$(readlink -f "$0")" "$@"
@@ -332,7 +332,7 @@ ensure_mac() {
     echo "generated sandbox MAC (retained on host): $CT_MAC"
   fi
   echo "$CT_MAC" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' \
-    || die "invalid MAC '$CT_MAC' in $MAC_FILE — delete the file or set CT_MAC"
+    || die "invalid MAC '$CT_MAC' in $MAC_FILE - delete the file or set CT_MAC"
 }
 
 # Auto-deploy the PVE hookscript shim (idempotent). The shim only forwards
@@ -342,7 +342,7 @@ ensure_hook_snippet() {
   local self
   self="$(readlink -f "$0")"
   mkdir -p "$HOOK_SNIPPET_DIR"
-  printf '#!/usr/bin/env bash\n# ai-sandbox PVE hookscript shim — auto-generated, safe to overwrite\n# one shim serves every agent instance; the script maps vmid -> agent\nvmid="$1"; phase="$2"\nexec %q hook "$vmid" "$phase"\n' \
+  printf '#!/usr/bin/env bash\n# ai-sandbox PVE hookscript shim - auto-generated, safe to overwrite\n# one shim serves every agent instance; the script maps vmid -> agent\nvmid="$1"; phase="$2"\nexec %q hook "$vmid" "$phase"\n' \
     "$self" > "${HOOK_SNIPPET_DIR}/ai-sandbox-hook.sh"
   chmod +x "${HOOK_SNIPPET_DIR}/ai-sandbox-hook.sh"
 }
@@ -362,13 +362,16 @@ shared_setup() {
   exec 8>&-
 }
 
-# Push a host file into the CT as root:root with the given mode, creating
-# the destination directory. For profiles' credentials/policy functions.
+# Copy a host file into the CT as root:root with the given mode, creating
+# the destination directory. Streams the file through `pct exec` (stdin)
+# rather than `pct push`: push takes the CT's config lock, which Proxmox
+# holds for the whole Start task — post-start hook included — so a push
+# from GUI-Start provisioning times out. exec goes straight to lxc-attach.
+# The file is created under umask 077 and only then given its final mode,
+# so a secret is never briefly world-readable.
 ct_push_file() {   # $1 = host src, $2 = CT dest path, $3 = octal mode
-  pct exec "$CTID" -- mkdir -p "$(dirname "$2")" || return 1
-  pct push "$CTID" "$1" "$2" || return 1
-  pct exec "$CTID" -- chown root:root "$2" || return 1
-  pct exec "$CTID" -- chmod "$3" "$2"
+  pct exec "$CTID" -- sh -c 'umask 077 && mkdir -p "$(dirname "$1")" && cat > "$1" && chown root:root "$1" && chmod "$2" "$1"' \
+    sh "$2" "$3" < "$1"
 }
 
 template_auto() {
@@ -588,7 +591,7 @@ guard_ct() {
   fi
   # legacy sandbox from before tagging: our hostname AND our hookscript
   if [ "$hostname" = "$CTHOST" ] && echo "$cfg" | grep -q "^hookscript: ${HOOK_VOL_ID}$"; then
-    echo "guard: untagged legacy sandbox found — tagging CT $CTID as '$SANDBOX_TAG'"
+    echo "guard: untagged legacy sandbox found - tagging CT $CTID as '$SANDBOX_TAG'"
     pct set "$CTID" --tags "${tags:+${tags};}${SANDBOX_TAG}"
     return 0
   fi
@@ -707,7 +710,7 @@ datacenter_firewall_enabled() {
 warn_datacenter_firewall() {
   firewall_active || return 0
   datacenter_firewall_enabled && return 0
-  echo "warning: Proxmox Datacenter firewall is disabled (${FW_DIR}/cluster.fw) — per-CT egress rules in ${FW_DIR}/${CTID}.fw are NOT enforced yet." >&2
+  echo "warning: Proxmox Datacenter firewall is disabled (${FW_DIR}/cluster.fw) - per-CT egress rules in ${FW_DIR}/${CTID}.fw are NOT enforced yet." >&2
   echo "  to enable safely: ensure host SSH (22) & PVE UI (8006) access, then set Datacenter > Firewall > Options > Firewall: Yes." >&2
 }
 
@@ -763,7 +766,7 @@ configure_firewall() {
     return 0
   fi
   if [ -f "$fw_file" ] && ! grep -qF "$FW_MARKER" "$fw_file" 2>/dev/null; then
-    die "refusing to overwrite unmanaged firewall ruleset at $fw_file — remove it or set FIREWALL=off"
+    die "refusing to overwrite unmanaged firewall ruleset at $fw_file - remove it or set FIREWALL=off"
   fi
   mkdir -p "$FW_DIR"
   # Atomic same-directory rename avoids partial writes on pmxcfs (/etc/pve)
@@ -788,7 +791,7 @@ remove_firewall() {
 # default-deny config. A failed push aborts the build (fail closed).
 inject_agent_policy() {
   if [ "$AGENT_HARDEN" != "on" ]; then
-    echo "hardening: AGENT_HARDEN=off — skipping the $PROFILE_LABEL policy config"
+    echo "hardening: AGENT_HARDEN=off - skipping the $PROFILE_LABEL policy config"
     return 0
   fi
   "profile_${AGENT}_policy" || die "hardening: failed to inject the $PROFILE_LABEL policy config"
@@ -849,7 +852,7 @@ clobber_disk() {
   dev="$(pvesm path "$volid" 2>/dev/null || true)"
   case "$dev" in
     /dev/*) ;;
-    *) echo "clobber: $volid is not /dev-backed ($dev) — skipping wipe" >&2; return 0 ;;
+    *) echo "clobber: $volid is not /dev-backed ($dev) - skipping wipe" >&2; return 0 ;;
   esac
   if [ "$CLOBBER" = "zero" ]; then
     echo "clobber: zero-filling $dev ..."
@@ -860,7 +863,7 @@ clobber_disk() {
     # terminal, so an interactive `down` would silently skip the wipe.
     local err
     err="$(blkdiscard -f "$dev" 2>&1)" \
-      || echo "clobber: blkdiscard failed on $dev: ${err:-unknown error} — set CLOBBER=zero to overwrite instead" >&2
+      || echo "clobber: blkdiscard failed on $dev: ${err:-unknown error} - set CLOBBER=zero to overwrite instead" >&2
   fi
 }
 
@@ -961,7 +964,7 @@ EOF
 # whatever form its profile wants (env file, settings, token file...).
 inject_credentials() {
   if [ ! -f "$SECRETS_FILE" ]; then
-    echo "warning: no credential store at $SECRETS_FILE — $PROFILE_LABEL will need its own sign-in" >&2
+    echo "warning: no credential store at $SECRETS_FILE - $PROFILE_LABEL will need its own sign-in" >&2
     if declare -F "profile_${AGENT}_credentials_hint" >/dev/null; then
       "profile_${AGENT}_credentials_hint" >&2
     fi
@@ -978,7 +981,7 @@ provision_and_report() {
   local prov hook
   prov="$(mktemp)"
   provision_script > "$prov"
-  pct push "$CTID" "$prov" /root/provision-base.sh
+  ct_push_file "$prov" /root/provision-base.sh 700
   pct exec "$CTID" -- bash /root/provision-base.sh
   rm -f "$prov"
 
@@ -992,7 +995,7 @@ provision_and_report() {
   for hook in "${PROVISION_HOOKS[@]}"; do
     [ -f "$hook" ] || continue
     echo "running user provisioning hook $hook ..."
-    pct push "$CTID" "$hook" /root/provision.sh
+    ct_push_file "$hook" /root/provision.sh 700
     pct exec "$CTID" -- bash /root/provision.sh
   done
 }
@@ -1123,13 +1126,13 @@ add their own Host block to ssh-config.
 
 FIX THE IP (recommended)
 ------------------------
-  The sandbox MAC is also permanent — retained on the host across
-  rebuilds — so reserve the IP for it on your DHCP server (router,
+  The sandbox MAC is also permanent - retained on the host across
+  rebuilds - so reserve the IP for it on your DHCP server (router,
   pfSense/OPNsense, Pi-hole, whatever hands out addresses):
     ${mac:-unknown}
   With that reservation, the IP below never goes stale and 'ssh
   ${CTHOST}' just works after every rebuild. Without it, only the
-  HostName (IP) goes stale per rebuild — re-run 'export' on the host and
+  HostName (IP) goes stale per rebuild - re-run 'export' on the host and
   re-fetch, or edit the HostName line in your ssh config.
 
 Current sandbox IP: $ip
@@ -1159,7 +1162,7 @@ REBUILDS AND HOST KEYS
   for this one Host, so 'ssh ${CTHOST}' just works after every rebuild.
   (Windows OpenSSH maps /dev/null to NUL; if your ssh rejects the line,
   write NUL there instead.) With a hand-rolled config, expect REMOTE HOST
-  IDENTIFICATION HAS CHANGED after each rebuild — expected rotation,
+  IDENTIFICATION HAS CHANGED after each rebuild - expected rotation,
   not an attack; recover and reconnect:
     ssh-keygen -R $ip
 
@@ -1168,12 +1171,12 @@ PuTTY instead of OpenSSH
   puttygen "%USERPROFILE%\.ssh\ai-sandbox" -o ai-sandbox.ppk
   Host Name: $ip   Port: 22   User: root
   (load ai-sandbox.ppk under Connection > SSH > Auth > Credentials)
-  (each rebuild mints a fresh host key — accept it when PuTTY asks)
+  (each rebuild mints a fresh host key - accept it when PuTTY asks)
 
 Security
 --------
   The private key now also lives on this desktop. It is a dedicated
-  sandbox keypair — it unlocks every ai-sandbox instance (every future
+  sandbox keypair - it unlocks every ai-sandbox instance (every future
   rebuild too), not the Proxmox host. After fetching the tarball, delete the host-side
   copy so the key lives only on host and desktop:
     rm -rf $EXPORT_DIR
@@ -1187,14 +1190,14 @@ EOF
   echo "  fetch from your desktop (host SSH must be reachable from your LAN):"
   echo "    scp root@${hostip}:$EXPORT_DIR/ai-sandbox-${AGENT}-desktop.tar.gz ."
   if [ "$(hostname -I | wc -w)" -gt 1 ]; then
-    echo "  note: this host is multi-homed ($(hostname -I | awk '{$1=$1};1')) —"
+    echo "  note: this host is multi-homed ($(hostname -I | awk '{$1=$1};1')) -"
     echo "  if $hostip is not reachable from your desktop, rerun with:"
     echo "    HOST_IP=<reachable-address> $0 export $AGENT"
   fi
   echo "  then follow the README.txt inside; connect with: ssh ${CTHOST}"
-  echo "recommended: set a DHCP reservation for the sandbox MAC ${mac:-unknown} —"
+  echo "recommended: set a DHCP reservation for the sandbox MAC ${mac:-unknown} -"
   echo "  it is retained across rebuilds, so the IP stays stable forever"
-  echo "note: without a reservation, re-run 'export' after each rebuild — only the IP changes; the key is permanent"
+  echo "note: without a reservation, re-run 'export' after each rebuild - only the IP changes; the key is permanent"
   echo "note: rebuilds mint a fresh host key; the bundled ssh-config pins"
   echo "  StrictHostKeyChecking no for the sandbox Host, so desktop connects survive rebuilds"
   if [ -n "${PROFILE_VSCODE_EXT:-}" ]; then
@@ -1251,7 +1254,7 @@ cmd_hook() {
       stub_firewall_consistent || die "pre-start: firewall settings changed since CT $CTID was parked (FIREWALL=$FIREWALL, EGRESS_POLICY=$EGRESS_POLICY). On the host, run: $0 up $AGENT"
       configure_firewall   # refresh the host-side ruleset (a file under /etc/pve/firewall, not the CT config)
       clear_stub_marker    # booting now: from here on this is a used disk
-      echo "pre-start: CT $CTID is a fresh, never-booted stub — starting it"
+      echo "pre-start: CT $CTID is a fresh, never-booted stub - starting it"
       ;;  # PVE now boots the stub; post-start provisions it
     post-start)
       hook_lock "$phase" || exit 0
