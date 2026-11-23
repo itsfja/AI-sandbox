@@ -1,9 +1,12 @@
 # host-side credential stores — never commit
-.vibe-sandbox.env
-vibe-sandbox.env
-.env
+secrets.env
 *.env
+.env
 
 # host-side sandbox SSH keypair — never commit
-.vibe-sandbox-ssh
-.vibe-sandbox-ssh.pub
+ai-sandbox
+ai-sandbox.pub
+/ssh/
+
+# desktop export bundles
+*-desktop.tar.gz

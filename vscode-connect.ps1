@@ -1,37 +1,44 @@
-# vscode-connect.ps1: open VS Code straight into the vibe sandbox,
-# refreshing the desktop ssh entry first, so no manual export fetching
-# after rebuilds. Companion to vibe-sandbox.sh
-# (https://github.com/itsfja/mistral-sandbox).
+# vscode-connect.ps1: open VS Code straight into an ai-sandbox agent
+# instance, refreshing the desktop ssh entry first, so no manual export
+# fetching after rebuilds. Companion to ai-sandbox.sh
+# (https://github.com/itsfja/AI-sandbox).
 #
 # Usage (Windows 10+, PowerShell; ssh and scp are built in):
 #   $env:PVE_HOST = 'root@192.168.3.188'
-#   .\vscode-connect.ps1              # opens /root
-#   .\vscode-connect.ps1 /root/work    # other folder
+#   .\vscode-connect.ps1 mistral              # opens /root
+#   .\vscode-connect.ps1 mistral /root/work   # other folder
+#   (or $env:AGENT = 'mistral' instead of the first argument)
 #
 # Required env var:
 #   PVE_HOST    Proxmox host to reach over ssh, e.g. root@192.168.3.188
 #               (needs an account that can read the sandbox key there,
 #               root by default, and the host reachable from your LAN)
 # Optional env overrides (set before running):
-#   PVE_SCRIPT  path of vibe-sandbox.sh on the host (default /root/vibe-sandbox.sh)
-#   PVE_KEY     path of the managed sandbox private key on the host (default /root/vibe-sandbox-ssh)
-#   SSH_ALIAS   desktop ssh alias for the sandbox (default vibe-sandbox)
+#   PVE_SCRIPT  path of ai-sandbox.sh on the host (default /root/ai-sandbox.sh)
+#   PVE_KEY     path of the managed sandbox private key on the host
+#               (default /root/.ai-sandbox/ssh/ai-sandbox — one key for every agent)
+#   SSH_ALIAS   desktop ssh alias for the sandbox (default ai-sandbox-<agent>)
 #
 # Per run: same flow as vscode-connect.sh. See that script's header or the
 # README section 'Coding from the sandbox in VS Code (Remote-SSH)'.
 
+$Agent     = if ($args.Count -gt 0 -and $args[0]) { "$($args[0])" } elseif ($env:AGENT) { $env:AGENT } else { '' }
+if ($Agent -cnotmatch '^[a-z][a-z0-9]{0,15}$') {
+  Write-Host "vscode-connect: usage: .\vscode-connect.ps1 <agent> [folder]  (e.g. mistral; '/root/ai-sandbox.sh agents' on the host lists them)" -ForegroundColor Red
+  exit 1
+}
 $PveHost   = "$(if ($env:PVE_HOST)   { $env:PVE_HOST }   else { '' })"
-$PveScript = "$(if ($env:PVE_SCRIPT) { $env:PVE_SCRIPT } else { '/root/vibe-sandbox.sh' })"
-$PveKey    = "$(if ($env:PVE_KEY)    { $env:PVE_KEY }    else { '/root/vibe-sandbox-ssh' })"
-$SshAlias  = "$(if ($env:SSH_ALIAS)  { $env:SSH_ALIAS }  else { 'vibe-sandbox' })"
-$Workspace = if ($args.Count -gt 0 -and $args[0]) { "$($args[0])" } else { '/root' }
+$PveScript = "$(if ($env:PVE_SCRIPT) { $env:PVE_SCRIPT } else { '/root/ai-sandbox.sh' })"
+$PveKey    = "$(if ($env:PVE_KEY)    { $env:PVE_KEY }    else { '/root/.ai-sandbox/ssh/ai-sandbox' })"
+$SshAlias  = "$(if ($env:SSH_ALIAS)  { $env:SSH_ALIAS }  else { "ai-sandbox-$Agent" })"
+$Workspace = if ($args.Count -gt 1 -and $args[1]) { "$($args[1])" } else { '/root' }
 if (-not $Workspace.StartsWith('/')) { $Workspace = '/' + $Workspace }
 
 $SshDir     = Join-Path $env:USERPROFILE '.ssh'
-$KeyFile    = Join-Path $SshDir 'vibe-sandbox'
+$KeyFile    = Join-Path $SshDir 'ai-sandbox'
 $ConfigFile = Join-Path $SshDir 'config'
-$MarkBegin  = '# BEGIN vibe-sandbox (managed by vscode-connect.ps1; do not edit between markers)'
-$MarkEnd    = '# END vibe-sandbox'
+$MarkBegin  = "# BEGIN $SshAlias (managed by vscode-connect.ps1; do not edit between markers)"
+$MarkEnd    = "# END $SshAlias"
 
 function Die([string]$msg) { Write-Host "vscode-connect: $msg" -ForegroundColor Red; exit 1 }
 function Note([string]$msg) { Write-Host "vscode-connect: $msg" }
@@ -43,7 +50,7 @@ function Probe {
 
 function Launch {
   Note "opening VS Code in ssh-remote+$SshAlias$Workspace ..."
-  Note "first connect after a rebuild downloads vscode-server; the Mistral Vibe extension reinstalls itself when listed in remote.SSH.defaultExtensions (README: desktop setup, step 4), else one 'Install in SSH: $SshAlias' click."
+  Note "first connect after a rebuild downloads vscode-server; the agent's extension reinstalls itself when listed in remote.SSH.defaultExtensions (README: VS Code setup), else one 'Install in SSH: $SshAlias' click."
   code --folder-uri "vscode-remote://ssh-remote+$SshAlias$Workspace"
   exit $LASTEXITCODE
 }
@@ -64,9 +71,9 @@ if (Probe) { Launch }
 # --- stale path: refresh from the host ---------------------------------
 Note "ssh $SshAlias failed (stale IP after a rebuild?), refreshing from $PveHost ..."
 
-$newIp = (ssh $PveHost "$PveScript ip" | Select-Object -First 1)
+$newIp = (ssh $PveHost "$PveScript ip $Agent" | Select-Object -First 1)
 if ($LASTEXITCODE -ne 0) { Die "could not reach the Proxmox host at $PveHost" }
-if (-not $newIp) { Die "the sandbox is not running (no IP). Run '$PveScript up' on the Proxmox host first." }
+if (-not $newIp) { Die "the $Agent sandbox is not running (no IP). Run '$PveScript up $Agent' on the Proxmox host first." }
 Note "current sandbox IP: $newIp"
 
 New-Item -ItemType Directory -Force -Path $SshDir | Out-Null
@@ -80,14 +87,14 @@ if (-not (Test-Path $KeyFile)) {
 }
 
 # Rewrite ONLY the managed block: drop the previous managed block and any
-# legacy unmarked 'Host vibe-sandbox' block left by the manual export flow,
+# legacy unmarked 'Host <alias>' block left by the manual export flow,
 # keep every other host entry untouched, then append a fresh marked block.
 $block = @"
 $MarkBegin
 Host $SshAlias
     HostName $newIp
     User root
-    IdentityFile ~/.ssh/vibe-sandbox
+    IdentityFile ~/.ssh/ai-sandbox
     # disposable sandbox: every rebuild mints a FRESH host key, so strict
     # known-hosts checking would block the 2nd+ rebuild connect; scoped to
     # this Host alias only.
@@ -110,5 +117,5 @@ foreach ($i in 1..15) {
   if (Probe) { $ok = $true; break }
   Start-Sleep -Seconds 2
 }
-if (-not $ok) { Die "ssh $SshAlias still fails after refresh. Check the network/DHCP, or run '$PveScript status' on the Proxmox host." }
+if (-not $ok) { Die "ssh $SshAlias still fails after refresh. Check the network/DHCP, or run '$PveScript status $Agent' on the Proxmox host." }
 Launch
