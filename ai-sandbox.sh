@@ -855,8 +855,12 @@ clobber_disk() {
     echo "clobber: zero-filling $dev ..."
     dd if=/dev/zero of="$dev" bs=1M status=none || true
   else
-    blkdiscard "$dev" 2>/dev/null \
-      || echo "clobber: blkdiscard failed on $dev (rotational disk? use CLOBBER=zero)" >&2
+    # -f is required: util-linux >= 2.36 refuses a device that still holds
+    # a filesystem signature (the rootfs always does) whenever stdin is a
+    # terminal, so an interactive `down` would silently skip the wipe.
+    local err
+    err="$(blkdiscard -f "$dev" 2>&1)" \
+      || echo "clobber: blkdiscard failed on $dev: ${err:-unknown error} — set CLOBBER=zero to overwrite instead" >&2
   fi
 }
 

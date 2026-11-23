@@ -125,7 +125,8 @@ run "$S" up mistral >/dev/null 2>&1
 check "after up: no pristine-stub marker" [ ! -e "$T/state/mistral/pristine-stub" ]
 out="$(run FORCE=1 RESCUE=0 "$S" down mistral 2>&1)"; rc=$?
 check "down exits 0" [ $rc -eq 0 ]
-check "  ...clobbered via blkdiscard" grep -q '^blkdiscard ' "$T/calls.log"
+check "  ...clobbered via blkdiscard -f" grep -q '^blkdiscard -f /dev/' "$T/calls.log"
+check "  ...with no clobber failure" bash -c "! grep -q 'blkdiscard failed' <<<\"\$1\"" _ "$out"
 check "  ...stub exists, stopped, hook attached" [ -f "$T/conf/1051.conf" ] && [ ! -e "$T/run/1051" ] && grep -q hookscript "$T/conf/1051.conf"
 check "  ...pristine-stub marker written for CT 1051" [ "$(cat "$T/state/mistral/pristine-stub" 2>/dev/null)" = 1051 ]
 out="$(run "$S" status mistral 2>&1)"
