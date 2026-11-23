@@ -35,7 +35,8 @@
 #
 # Design invariants (carried over from mistral-sandbox; README has detail):
 #   SINGLE USE      nothing persists between sessions; `up` never resumes
-#   GUI-TRAPPED     PVE hookscript: Start = rebuild, Stop = clobber + stub
+#   GUI-TRAPPED     PVE hookscript: Stop = clobber + fresh stub, Start =
+#                   boot that never-booted stub and provision it
 #   GUARDED         destroy/clobber only CTs carrying our hostname AND tag
 #   WORK-GUARDED    teardown refuses to lose unpushed git work; approved
 #                   teardowns are rescue-archived with vzdump first
@@ -136,6 +137,7 @@ apply_defaults() {
   EXPORT_DIR="${EXPORT_DIR:-/root/ai-sandbox-export/${AGENT}}"
   LOCK_FILE="/run/lock/ai-sandbox.${AGENT}.lock"
   GUARD_STAMP="/run/lock/ai-sandbox.${AGENT}.workguard-ok"
+  STUB_MARKER="${INSTANCE_DIR}/pristine-stub"   # "this stopped CT has never booted"
   FORCE="${FORCE:-0}"                  # 1 = skip the work-loss guard prompt (still rescue-archives)
   RESCUE="${RESCUE:-1}"                # 1 = vzdump before an approved guarded teardown
   RESCUE_STORAGE="${RESCUE_STORAGE:-auto}"   # ordered storage IDs; "auto" = first with backup content
@@ -596,6 +598,7 @@ guard_ct() {
 destroy_sandbox() {
   guard_ct   # ownership interlock: never destroy a CT that is not ours
   work_guard destroy || die "work guard: refusing to destroy CT $CTID"
+  clear_stub_marker   # whatever comes next is not the parked stub
   if ct_exists; then
     ct_running && pct stop "$CTID"
     pct destroy "$CTID" --purge
@@ -865,6 +868,40 @@ park_sandbox() {
   destroy_sandbox
   shared_setup
   create_sandbox stopped
+  mark_stub_pristine
+}
+
+# Pristine-stub marker. GUI Start cannot rebuild the CT: Proxmox holds the
+# CT's config lock (/run/lock/lxc/pve-config-<CTID>.lock) for the whole
+# Start task, pre-start hook included, so any pct destroy/create from the
+# hook waits on its own task and times out. Instead, every park (down, GUI
+# Stop) leaves a freshly created, never-booted stub and records that here;
+# pre-start only lets a stub carrying this mark boot. The mark lives under
+# STATE_DIR (survives a host reboot) and is cleared by any destroy and by
+# pre-start itself, so a disk that has ever booted never counts as fresh.
+mark_stub_pristine() {
+  mkdir -p "$(dirname "$STUB_MARKER")"
+  printf '%s\n' "$CTID" > "$STUB_MARKER"
+}
+
+clear_stub_marker() { rm -f "$STUB_MARKER"; }
+
+stub_is_pristine() {
+  [ -f "$STUB_MARKER" ] && [ "$(cat "$STUB_MARKER" 2>/dev/null)" = "$CTID" ] \
+    && ct_exists && ! ct_running
+}
+
+# The stub's net0 firewall flag was fixed when it was parked; if FIREWALL or
+# EGRESS_POLICY changed since, the CT config would need editing, which
+# pre-start cannot do under Proxmox's lock.
+stub_firewall_consistent() {
+  local net0
+  net0="$(pct config "$CTID" 2>/dev/null | awk '/^net0:/ {print $2}')"
+  if firewall_active; then
+    [[ ",${net0}," == *",firewall=1,"* ]]
+  else
+    [[ ",${net0}," != *",firewall=1,"* ]]
+  fi
 }
 
 # Provisioning script, executed INSIDE the fresh CT on every build: an
@@ -1176,7 +1213,8 @@ hook_agent_for() {   # $1 = vmid; echoes agent or nothing
 
 # INTERNAL: entry point for the PVE hookscript shim. PVE calls the shim with
 # (vmid, phase); the shim execs this. Phases:
-#   pre-start  — destroy + recreate fresh, stopped; PVE then boots the NEW CT
+#   pre-start  — allow the boot only if the CT is a pristine stub (see
+#                mark_stub_pristine); otherwise abort the Start
 #   post-start — wait for IP, provision, log the ssh line
 #   pre-stop   — work guard: refuse stops that would lose unextracted work
 #   post-stop  — clobber + park stub
@@ -1197,14 +1235,20 @@ cmd_hook() {
   select_agent "$agent"
   case "$phase" in
     pre-start)
+      # Runs INSIDE Proxmox's Start task, under the CT's config lock: no
+      # pct destroy/create/set on this CT from here (they would time out
+      # on that lock). Boot only a pristine stub left by down / GUI Stop;
+      # anything else aborts the Start (non-zero exit) with directions.
       self_check hook "$vmid" "$phase"
       hook_lock "$phase" || exit 0
       validate_hardening_config
-      echo "pre-start: rebuilding $AGENT sandbox CT $CTID fresh"
-      destroy_sandbox
-      shared_setup
-      create_sandbox stopped
-      ;;  # PVE now starts the newly created CT
+      guard_ct
+      stub_is_pristine || die "pre-start: CT $CTID is not a fresh stub (it has booted since it was built, or was not parked by 'down' / GUI Stop). GUI Start cannot rebuild it, because Proxmox holds the CT's lock during Start. On the host, run: $0 up $AGENT"
+      stub_firewall_consistent || die "pre-start: firewall settings changed since CT $CTID was parked (FIREWALL=$FIREWALL, EGRESS_POLICY=$EGRESS_POLICY). On the host, run: $0 up $AGENT"
+      configure_firewall   # refresh the host-side ruleset (a file under /etc/pve/firewall, not the CT config)
+      clear_stub_marker    # booting now: from here on this is a used disk
+      echo "pre-start: CT $CTID is a fresh, never-booted stub — starting it"
+      ;;  # PVE now boots the stub; post-start provisions it
     post-start)
       hook_lock "$phase" || exit 0
       guard_ct
@@ -1249,7 +1293,11 @@ cmd_status() {
   if ct_running; then
     echo "$AGENT: CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
   else
-    echo "$AGENT: CT $CTID exists but stopped (stub or unprovisioned), firewall: ${fw_info}"
+    if stub_is_pristine; then
+      echo "$AGENT: CT $CTID stopped: fresh stub, ready for GUI Start, firewall: ${fw_info}"
+    else
+      echo "$AGENT: CT $CTID stopped: NOT a fresh stub (GUI Start will refuse; run '$0 up $AGENT'), firewall: ${fw_info}"
+    fi
   fi
 }
 

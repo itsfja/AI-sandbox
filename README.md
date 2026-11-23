@@ -50,8 +50,8 @@ See [Roadmap](#roadmap) for what is coming and the design decisions behind it.
   host (`/root/.ai-sandbox/<agent>/mac`), and pinned on every rebuild, so
   one DHCP reservation per agent fixes its IP forever.
 - **GUI-trapped** — the Proxmox GUI drives the lifecycle: right-click
-  Start = fresh rebuild + provisioning; Stop = disk clobber + parked
-  stub; Restart = fresh rebuild. One shared `pct` hookscript shim serves
+  Stop = disk clobber + a freshly built, never-booted stub; Start = boot
+  that stub and provision it. One shared `pct` hookscript shim serves
   every instance and maps the CT back to its agent by hostname.
 - **Clobbered** — on stop, the rootfs is discarded (`CLOBBER=discard`) or
   zero-filled (`CLOBBER=zero`) and the CT is replaced by a pristine,
@@ -461,8 +461,9 @@ hookscript, so the Proxmox GUI becomes the front end:
 
 ```mermaid
 flowchart TD
-    S["GUI: right-click Start"] --> PS1["pre-start hook:<br/>map CT to agent, guard,<br/>destroy + recreate fresh"]
-    PS1 --> PVEB["PVE boots the NEW container"]
+    S["GUI: right-click Start"] --> PS1["pre-start hook:<br/>map CT to agent, guard,<br/>check it is a never-booted stub"]
+    PS1 -->|fresh stub| PVEB["PVE boots the stub"]
+    PS1 -->|anything else| AB["Start aborted:<br/>run 'up agent' on the host"]
     PVEB --> PS2["post-start hook:<br/>provision + inject credentials + policy<br/>ssh line goes to the task log"]
     T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>guard + clobber rootfs + park fresh stub"]
     R["GUI: right-click Restart"] --> PR2
@@ -471,9 +472,9 @@ flowchart TD
 
 | GUI action | What actually happens |
 | --- | --- |
-| Start | fresh rebuild from template, then provisioning; the Start task stays busy until provisioning finishes — open its log for the `ssh -i ...` line |
-| Stop / Shutdown | rootfs clobbered (`CLOBBER`), CT replaced by a pristine stopped stub |
-| Restart | stop phases, then start phases: a fresh rebuild |
+| Start | boots the pristine stub left by the last Stop / `down`, then provisions it; the Start task stays busy until provisioning finishes — open its log for the `ssh -i ...` line. A CT that has booted since it was built is refused (see below) |
+| Stop / Shutdown | rootfs clobbered (`CLOBBER`), CT replaced by a freshly built, never-booted stub |
+| Restart | stop phases, then start phases: clobber, fresh stub, boot, provision (test it on your PVE build) |
 | Snapshot / Clone / Migrate / Backup / Console | **not trappable** (no hook phase) — harmless, since the next Start purges everything |
 
 The hook runs without your shell's environment: it finds the agent from
@@ -487,13 +488,20 @@ hook passes through with a one-line notice. When the GUI triggers it,
 the hook takes the lock and does the work. Locks are per agent, so one
 agent's build never makes another agent's hook pass through.
 
-Honest caveats:
+Why Start does not rebuild: Proxmox holds the CT's config lock
+(`/run/lock/lxc/pve-config-<CTID>.lock`) for the whole Start task,
+including the pre-start hook, so the hook cannot destroy or recreate the
+CT — it would wait on its own task and time out. The rebuild therefore
+happens at Stop: every Stop / `down` leaves a freshly built stub and
+records that it has never booted (`/root/.ai-sandbox/<agent>/pristine-stub`).
+Start only boots a stub carrying that record and clears it as it boots.
+Anything else — a CT that ran and was never parked (host crash, `pct
+start` by hand), or a stub whose firewall settings changed since it was
+parked — makes pre-start abort the Start with a message to run
+`/root/ai-sandbox.sh up <agent>` on the host. `status <agent>` shows
+which state a stopped CT is in.
 
-- **Test on your PVE build first.** The pre-start hook recreates the CT
-  while PVE is mid-Start on the same vmid. It works because the
-  recreated config and disk volid are identical, but it is the piece most
-  sensitive to PVE updates. (PTF 2's golden-template clones make this the
-  rare path.)
+Honest caveats:
 - **Clobber levels.** `discard` is instant on SSDs but relies on TRIM —
   not guaranteed against chip-level forensics. `zero` is overwrite-grade
   at the cost of a few minutes per stop. Neither protects the *host's*
@@ -696,6 +704,14 @@ PVE hookscript.)
   reservation for the agent's MAC.
 - GUI Start finishes but no ssh line in the task log — the post-start
   hook found no IP or provisioning failed; read the task log above it.
+- GUI Start fails with `pre-start: CT <id> is not a fresh stub` — the CT
+  has booted since it was built (for example the host went down while
+  the sandbox was running) and was never parked. Run
+  `/root/ai-sandbox.sh up <agent>` on the host; Stop/Start works again
+  after that.
+- GUI Start fails with `can't lock file '/run/lock/lxc/pve-config-<id>.lock'`
+  — another task on that CT is still running (a second click, say).
+  Wait for it to finish, then try once.
 - `self-check: could not fetch/validate ...` (warning, build continues) —
   the self-update check could not reach `RAW_URL`; harmless offline.
 - GUI console refuses every login — by design: no root password, key-only

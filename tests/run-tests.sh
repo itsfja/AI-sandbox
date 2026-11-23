@@ -122,18 +122,48 @@ check "hook ignores a CT that is not ai-sandbox-*" [ $rc -eq 0 ] && grep -q word
 echo "== GUI hook path + down + status/export"
 fresh
 run "$S" up mistral >/dev/null 2>&1
+check "after up: no pristine-stub marker" [ ! -e "$T/state/mistral/pristine-stub" ]
 out="$(run FORCE=1 RESCUE=0 "$S" down mistral 2>&1)"; rc=$?
 check "down exits 0" [ $rc -eq 0 ]
 check "  ...clobbered via blkdiscard" grep -q '^blkdiscard ' "$T/calls.log"
 check "  ...stub exists, stopped, hook attached" [ -f "$T/conf/1051.conf" ] && [ ! -e "$T/run/1051" ] && grep -q hookscript "$T/conf/1051.conf"
-# simulate GUI Start: PVE runs pre-start (env-less), boots, runs post-start
-: > "$T/calls.log"
-out="$(env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst $S hook 1051 pre-start" 2>&1)"; rc=$?
-check "GUI pre-start rebuilds (destroy + create stopped)" [ $rc -eq 0 ] && grep -q '^pct destroy 1051' "$T/calls.log" && grep -q '^pct create 1051' "$T/calls.log"
+check "  ...pristine-stub marker written for CT 1051" [ "$(cat "$T/state/mistral/pristine-stub" 2>/dev/null)" = 1051 ]
+out="$(run "$S" status mistral 2>&1)"
+check "status reports a fresh stub" grep -q 'stopped: fresh stub, ready for GUI Start' <<<"$out"
+# GUI Start: PVE holds the CT config lock for the whole task and runs
+# pre-start env-less; then boots; then runs post-start (lock released).
+gui_hook() {   # $1 = vmid, $2 = phase; env-less like PVE
+  env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst $S hook $1 $2" 2>&1
+}
+mkdir -p "$T/locked"; touch "$T/locked/1051"; : > "$T/calls.log"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check "GUI pre-start under the PVE lock succeeds on a fresh stub" [ $rc -eq 0 ]
 [ $rc -eq 0 ] || echo "$out" | tail -5
-touch "$T/run/1051"
+check "  ...without touching the CT (no destroy/create/set)" bash -c "! grep -qE '^pct (destroy|create|set) ' '$T/calls.log'"
+check "  ...says it is starting the stub" grep -q 'fresh, never-booted stub' <<<"$out"
+check "  ...and consumes the marker" [ ! -e "$T/state/mistral/pristine-stub" ]
+rm -f "$T/locked/1051"; touch "$T/run/1051"
 out="$(run "$S" hook 1051 post-start 2>&1)"
 check "GUI post-start provisions + reports" grep -q 'mistral sandbox ready via GUI' <<<"$out" && [ -f "$T/ct/1051/root/.vibe/config.toml" ]
+# a used (booted) CT must not be started again from the GUI
+rm -f "$T/run/1051"; touch "$T/locked/1051"; : > "$T/calls.log"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check "GUI pre-start refuses a CT that has booted" [ $rc -ne 0 ]
+check "  ...pointing at 'up mistral'" grep -q 'is not a fresh stub.*up mistral' <<<"$out"
+check "  ...without touching the CT" bash -c "! grep -qE '^pct (destroy|create|set) ' '$T/calls.log'"
+rm -f "$T/locked/1051"
+out="$(run "$S" status mistral 2>&1)"
+check "status flags the used stopped CT" grep -q 'NOT a fresh stub' <<<"$out"
+# firewall settings changed between park and Start -> refuse, don't boot
+run FORCE=1 RESCUE=0 "$S" down mistral >/dev/null 2>&1
+touch "$T/locked/1051"
+out="$(gui_hook_fw_off() { env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "FIREWALL=off STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off $S hook 1051 pre-start" 2>&1; }; gui_hook_fw_off)"; rc=$?
+check "GUI pre-start refuses when firewall settings changed since park" [ $rc -ne 0 ] && grep -q 'firewall settings changed' <<<"$out"
+check "  ...and keeps the stub pristine for a later Start" [ -e "$T/state/mistral/pristine-stub" ]
+rm -f "$T/locked/1051"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check "  ...then starts fine with the original settings" [ $rc -eq 0 ]
+touch "$T/run/1051"; run "$S" hook 1051 post-start >/dev/null 2>&1
 out="$(run "$S" status 2>&1)"
 check "status (all) shows mistral running" grep -qE '^mistral +1051 +running +192\.168\.3\.77' <<<"$out"
 out="$(run "$S" export mistral 2>&1)"; rc=$?
