@@ -1,184 +1,220 @@
 #!/usr/bin/env bash
 # ============================================================================
-# vibe-sandbox.sh — single-use, rebuild-on-demand LXC sandbox for Proxmox VE
+# ai-sandbox.sh — single-use, rebuild-on-demand LXC sandboxes for AI coding
+#                 agents on Proxmox VE (Mistral Vibe today; Claude Code,
+#                 Gemini CLI and drop-in profiles to follow)
 #
-# Semantics (by design):
-#   * SINGLE USE:      one sandbox exists at a time (fixed CTID); `down`
-#                      destroys it completely. Nothing persists between uses.
-#   * AUTO REBUILD:    `up` NEVER resumes an old container — it destroys any
-#                      existing one and builds a fresh CT from the template,
-#                      so every startup is a clean rebuild.
-#   * SERIALLY REBUILDABLE: a global flock serializes all operations, and the
-#                      build is deterministic from the config block below,
-#                      so rebuild #1 == rebuild #50.
-#   * INTERNET-ENABLED: outbound net is unrestricted — the agent can
-#                      download any tool it needs (apt, curl, pip, uv, npm)
-#                      and search/fetch the web whenever required.
-#   * MISTRAL-TOOLED:  every rebuild installs the CURRENT Vibe CLI
-#                      (mistral-vibe) at build time, so each fresh sandbox
-#                      gets the latest iteration of Mistral tooling.
-#   * CREDENTIALD:     a permanent key store on the HOST ($SECRETS_FILE,
-#                      default /root/.vibe-sandbox.env, mode 600) is
-#                      re-injected into every rebuild as /root/.vibe/.env.
-#                      The key is a normal Mistral API key: create it at
-#                      chat.mistral.ai (Code > Vibe CLI), revoke or rotate
-#                      it from the console at any time. The key lives only
-#                      in the host file and the ephemeral CT — never in
-#                      this script or any repository.
-#   * SSH-KEYED:       a dedicated sandbox keypair is retained on the HOST
-#                      (default /root/.vibe-sandbox-ssh), generated on the
-#                      first `up` and reused for every rebuild; only the
-#                      public half is injected into the CT. The private key
-#                      stays on the host. Override with SSH_PUBKEY to
-#                      reuse an existing key instead.
-#   * MAC-RETAINED:    the sandbox's MAC address is generated once and
-#                      retained on the HOST ($MAC_FILE, default
-#                      /root/.vibe-sandbox.mac), then pinned (hwaddr) on
-#                      every rebuild — PVE would otherwise mint a fresh
-#                      random MAC each time. A DHCP reservation for that
-#                      MAC therefore keeps the same IP across rebuilds.
-#                      Override with CT_MAC to pin a specific MAC.
-#   * GUI-TRAPPED:      with HOOK=on (default), the Proxmox GUI drives the
-#                      whole lifecycle through a pct hookscript:
-#                        right-click Start   = fresh rebuild + provisioning
-#                        right-click Stop    = disk clobber + parked stub
-#                        right-click Restart = fresh rebuild
-#                      The hook shim is auto-deployed to local:snippets on
-#                      every run; set HOOK=off to disable GUI trapping.
-#   * CLOBBERED:        on stop, the rootfs is discarded (CLOBBER=discard,
-#                      default, instant on SSD) or zero-filled (CLOBBER=zero,
-#                      slower but overwrite-grade) and the CT is replaced
-#                      by a pristine, unprovisioned STOPPED STUB with the
-#                      same CTID — so the GUI keeps a Start-able object
-#                      while the stopped sandbox holds nothing from the
-#                      previous session. CLOBBER=off skips the wipe.
-#   * GUARDED:          every destroy/clobber passes guard_ct(): the CT must
-#                      carry this script's ownership tag (SANDBOX_TAG,
-#                      default 'vibe-sandbox') AND the sandbox hostname.
-#                      A same-ID collision — another system squatting on
-#                      $CTID by design or by operator error — aborts loudly
-#                      instead of being destroyed. The guard fails closed:
-#                      in GUI hooks, a refused check aborts the task.
+# Usage:  ai-sandbox.sh <command> [agent]        (or AGENT=<agent> in env)
 #
-#   * WORK-GUARDED:     no teardown silently incinerates unextracted work.
-#                      Before up/down/purge or a GUI Stop/Restart kills a
-#                      RUNNING sandbox, it is scanned for git repos holding
-#                      uncommitted changes, meaningful new files, or
-#                      commits not on any remote. Findings abort the
-#                      teardown (interactive default-No confirm;
-#                      fail-closed when unattended, e.g. cron) unless
-#                      FORCE=1. An approved teardown is first rescue-
-#                      archived to backup storage (vzdump, keeping the
-#                      last RESCUE_KEEP copies; RESCUE=0 skips the
-#                      archive). A pass is stamped in /run so the
-#                      hookscript's pre-stop, a separate PVE process
-#                      without the caller's environment, lets an
-#                      already-approved stop through.
+#   up      <agent>  rebuild + start + provision + print SSH line
+#   down    <agent>  clobber disk + park a fresh stopped stub (GUI Start-able)
+#   purge   <agent>  destroy completely — no stub, gone from the tree
+#   reset   <agent>  down then up (fresh rebuild mid-work)
+#   status  [agent]  one sandbox, or every ai-sandbox CT when no agent given
+#   shell   <agent>  root shell inside the CT
+#   ip      <agent>  current IP (empty if not running)
+#   export  <agent>  desktop bundle: keypair + ssh-config (after 'up')
+#   agents           list the agent profiles this script knows
+#   update           self-update from main (previous copy kept as .bak)
+#   hook             INTERNAL — called by the PVE hookscript shim (vmid, phase)
 #
-#   * SELF-UPDATING:    the script is installed by hand, so local copies
-#                      drift silently — a bug fixed on main keeps biting a
-#                      stale copy (that is how #10 went unnoticed). Build
-#                      paths (`up`, GUI pre-start) sha256-check against
-#                      main (RAW_URL): if stale, install the current copy
-#                      (backup at $0.bak, atomic mv) and re-exec ONCE, so
-#                      the build runs current code. The check degrades to
-#                      a warning when it cannot run. AUTO_UPDATE=off
-#                      disables; `update` does it explicitly.
+# Each agent is its own INSTANCE: own CTID, hostname (ai-sandbox-<agent>),
+# MAC, credentials and lock, so several sandboxes can run side by side.
+# One SSH keypair serves them all.
 #
-#   * CONNECTOR-HARDENED: every rebuild injects a hardened /root/.vibe/config.toml
-#                      (mode 400) disabling Vibe connectors (VIBE_CONNECTORS=off),
-#                      MCP servers (VIBE_MCP=off), and auto-approve/YOLO bypass
-#                      (VIBE_AUTO_APPROVE=off) by default. VIBE_HARDEN=off skips
-#                      config injection. Account-level Vibe Work connectors live
-#                      outside the CT and must also be disabled per-chat (README).
+# Host state lives under $STATE_DIR (default /root/.ai-sandbox):
+#   ssh/ai-sandbox[.pub]     sandbox keypair (generated on first build)
+#   config.env               optional settings for every instance
+#   <agent>/config.env       optional settings for one instance
+#   <agent>/secrets.env      the agent's credential (mode 600, never committed)
+#   <agent>/mac              retained MAC (generated on first build)
+# config.env files hold plain KEY=value lines (never executed). Precedence:
+# command-line env > <agent>/config.env > config.env > built-in default.
+# Put lasting overrides there: GUI Start/Stop hooks run WITHOUT your shell
+# environment, so only the config files reach them.
 #
-#   * EGRESS-FIREWALLED: with FIREWALL=on (default), net0 is attached with
-#                      firewall=1 and a host-side PVE ruleset is written to
-#                      /etc/pve/firewall/<CTID>.fw (outside container root
-#                      control). Default EGRESS_POLICY=lan-block allows inbound
-#                      SSH + outbound DHCP/DNS/internet while dropping outbound
-#                      RFC1918 LAN, link-local/metadata, CGNAT, and IPv6 ULA;
-#                      EGRESS_POLICY=strict sets policy_out=DROP with explicit
-#                      EGRESS_ALLOW CIDRs/IPs; EGRESS_POLICY=off disables.
-#                      Enforced when Proxmox Datacenter firewall is enabled.
+# Design invariants (carried over from mistral-sandbox; README has detail):
+#   SINGLE USE      nothing persists between sessions; `up` never resumes
+#   GUI-TRAPPED     PVE hookscript: Start = rebuild, Stop = clobber + stub
+#   GUARDED         destroy/clobber only CTs carrying our hostname AND tag
+#   WORK-GUARDED    teardown refuses to lose unpushed git work; approved
+#                   teardowns are rescue-archived with vzdump first
+#   HARDENED        default-deny agent config (connectors/MCP/auto-approve)
+#                   plus a host-side PVE egress firewall (lan-block)
+#   SELF-UPDATING   build paths sha256-check against main and self-install
 #
-# Run ON the Proxmox host as root (uses `pct` / `pveam` / `pvesm`).
-# Tested syntax: PVE 8.x. Review flags against your version before first run.
-#
-# Subcommands:
-#   up        rebuild + start + provision + print SSH line
-#   down      clobber disk + park a fresh stopped stub (GUI Start-able)
-#   purge     destroy completely — no stub, gone from the tree
-#   reset     down then up (fresh rebuild mid-work)
-#   status    is the sandbox up? show CTID, state, IP
-#   shell     drop into a root shell inside the CT
-#   ip        print the current IP (empty if not running)
-#   export    bundle the keypair + ssh-config for desktop use (after 'up')
-#   update    self-update the script from main (previous copy kept as .bak)
-#   hook      INTERNAL — called by the PVE hookscript shim with (vmid, phase)
-#
-# Optional: place a `provision.sh` beside this script — it runs INSIDE the
-# fresh CT on every build, AFTER the base provisioning (extra toolchains, repo
-# clone, etc.). Keep it deterministic to keep rebuilds identical.
-#
-# NOTE on auth: with SECRETS_FILE present, `vibe` authenticates from the
-# injected /root/.vibe/.env (MISTRAL_API_KEY=...) on every rebuild — no
-# interactive wizard needed. If the file is missing, builds still work, but
-# the first `vibe` launch falls back to the setup wizard (browser URL or
-# pasted key). Verify the active credential source in-session with
-# `/whoami` or `/status`.
+# Optional: a `provision.sh` beside this script, or <agent>/provision.sh
+# under $STATE_DIR, runs INSIDE the fresh CT after base provisioning.
 # ============================================================================
 
 set -euo pipefail
 
+# --------------------------- agent & instance --------------------------------
+STATE_DIR="${STATE_DIR:-/root/.ai-sandbox}"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Read KEY=value lines from a config file WITHOUT executing it. A key already
+# set in the environment wins, so command-line overrides beat the file; the
+# first file loaded wins over later ones (load the most specific first).
+load_config_file() {   # $1 = path
+  local file="$1" line key val
+  [ -f "$file" ] || return 0
+  [ "$(stat -c %u "$file")" = "0" ] || die "refusing $file: not owned by root"
+  case "$(stat -c %a "$file")" in
+    *[2367]?|*?[2367]) die "refusing $file: group/other-writable" ;;
+  esac
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in ''|'#'*) continue ;; esac
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Z][A-Z0-9_]*)=(.*)$ ]] \
+      || die "bad line in $file: $line"
+    key="${BASH_REMATCH[2]}"
+    val="${BASH_REMATCH[3]}"
+    case "$key" in
+      AGENT|STATE_DIR) die "$key cannot be set in $file" ;;
+    esac
+    # strip one pair of matching surrounding quotes; no expansion, ever
+    if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
+      val="${BASH_REMATCH[1]}"
+    fi
+    # plain assignment, NOT export: pct exec passes the host environment
+    # into the CT, and config values have no business leaking in there
+    [ -n "${!key+x}" ] || printf -v "$key" '%s' "$val"
+  done < "$file"
+}
+
+valid_agent_name() { [[ "${1:-}" =~ ^[a-z][a-z0-9]{0,15}$ ]]; }
+profile_exists()   { valid_agent_name "$1" && declare -F "profile_${1}_meta" >/dev/null; }
+
+# Resolve AGENT, load its profile metadata and config files, then derive the
+# instance defaults. Called once per run, before any instance operation.
+select_agent() {   # $1 = agent (may be empty: falls back to $AGENT)
+  AGENT="${1:-${AGENT:-}}"
+  [ -n "$AGENT" ] || die "no agent given — usage: $0 <command> <agent>; known agents: $(list_profiles)"
+  profile_exists "$AGENT" || die "unknown agent '$AGENT'; known agents: $(list_profiles)"
+  load_config_file "${STATE_DIR}/${AGENT}/config.env"
+  load_config_file "${STATE_DIR}/config.env"
+  "profile_${AGENT}_meta"
+  apply_defaults
+}
+
+list_profiles() {
+  declare -F | awk '{print $3}' | sed -n 's/^profile_\([a-z][a-z0-9]*\)_meta$/\1/p' | paste -sd' ' -
+}
+
 # --------------------------- configuration ---------------------------------
-CTID="${CTID:-1042}"                 # fixed ID = only one sandbox ever exists
-CTHOST="${CTHOST:-vibe-sandbox}"
-CORES="${CORES:-4}"
-RAM_MB="${RAM_MB:-4096}"
-SWAP_MB="${SWAP_MB:-2048}"
-DISK_GB="${DISK_GB:-40}"
-STORAGE="${STORAGE:-local-lvm}"       # storage for rootfs
-BRIDGE="${BRIDGE:-vmbr0}"
-TEMPLATE="${TEMPLATE:-}"              # e.g. local:vztmpl/debian-12-standard_...tar.zst
-                                     # empty = auto-pick newest Debian 12 template
-SSH_PUBKEY="${SSH_PUBKEY:-}"           # optional override; empty = managed keypair
-SSH_KEY_FILE="${SSH_KEY_FILE:-/root/.vibe-sandbox-ssh}"   # host-side keypair (permanent)
-MAC_FILE="${MAC_FILE:-/root/.vibe-sandbox.mac}"  # host-side MAC store (permanent)
-CT_MAC="${CT_MAC:-}"                   # optional override; empty = managed MAC
-SECRETS_FILE="${SECRETS_FILE:-/root/.vibe-sandbox.env}"   # host-side key store
-HOOK="${HOOK:-on}"                    # on = attach PVE hookscript (GUI trap)
-CLOBBER="${CLOBBER:-discard}"         # discard | zero | off — post-stop rootfs wipe
-SANDBOX_TAG="${SANDBOX_TAG:-vibe-sandbox}"   # ownership tag; guard_ct() enforces it
-HOOK_VOL_ID="local:snippets/vibe-sandbox-hook.sh"
+# Instance-independent settings first; per-instance ones in apply_defaults.
+SANDBOX_TAG="${SANDBOX_TAG:-ai-sandbox}"   # ownership tag; guard_ct() enforces it
+HOOK_VOL_ID="local:snippets/ai-sandbox-hook.sh"
 HOOK_SNIPPET_DIR="${HOOK_SNIPPET_DIR:-/var/lib/vz/snippets}"
-PROVISION_HOOK="$(dirname "$0")/provision.sh"
-EXPORT_DIR="${EXPORT_DIR:-/root/vibe-sandbox-export}"     # desktop bundle output dir
 AUTO_UPDATE="${AUTO_UPDATE:-on}"        # on = build paths self-check against main; off = never check
-RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/itsfja/mistral-sandbox/main/vibe-sandbox.sh}"
-LOCK_FILE="/run/lock/vibe-sandbox.lock"
-FORCE="${FORCE:-0}"                   # 1 = skip the work-loss guard entirely
-GUARD_STAMP="/run/lock/vibe-sandbox.workguard-ok"  # fresh pass lets the hook pre-stop through
-GUARD_STAMP_TTL=600                   # seconds a guard pass remains valid
-RESCUE="${RESCUE:-1}"                 # 1 = before an approved guarded teardown, vzdump the CT to rescue storage
-RESCUE_STORAGE="${RESCUE_STORAGE:-unraid-lvm,auto}"  # rescue backup storages in preference order; "auto" = first with backup content
-RESCUE_KEEP="${RESCUE_KEEP:-2}"       # rescue archives of this CT to keep on the storage
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/itsfja/AI-sandbox/main/ai-sandbox.sh}"
+SHARED_LOCK="/run/lock/ai-sandbox.shared.lock"   # template/key/hook setup across instances
+GUARD_STAMP_TTL=600                   # seconds a work-guard pass remains valid
 STORAGE_CFG="${STORAGE_CFG:-/etc/pve/storage.cfg}"  # storage definitions (content/path lookup)
-VIBE_HARDEN="${VIBE_HARDEN:-on}"      # on = inject hardened /root/.vibe/config.toml; off = skip
-VIBE_CONNECTORS="${VIBE_CONNECTORS:-off}"       # off = disable Vibe connectors; on = allow
-VIBE_MCP="${VIBE_MCP:-off}"                     # off = disable MCP servers; on = allow
-VIBE_AUTO_APPROVE="${VIBE_AUTO_APPROVE:-off}"   # off = disable auto-approve/YOLO; on = allow
-FIREWALL="${FIREWALL:-on}"            # on = attach PVE firewall=1 and write per-CT rules; off = skip
-EGRESS_POLICY="${EGRESS_POLICY:-lan-block}"     # lan-block | strict | off
-EGRESS_ALLOW="${EGRESS_ALLOW:-}"      # optional comma-separated IPs/CIDRs allowed outbound
 FW_DIR="${FW_DIR:-/etc/pve/firewall}" # Proxmox firewall config dir (contains cluster.fw & <CTID>.fw)
 
+apply_defaults() {
+  CTID="${CTID:-$PROFILE_CTID}"        # fixed ID per agent = one sandbox per agent
+  CTHOST="ai-sandbox-${AGENT}"         # derived, not configurable: the hook maps it back to the agent
+  CORES="${CORES:-4}"
+  RAM_MB="${RAM_MB:-4096}"
+  SWAP_MB="${SWAP_MB:-2048}"
+  DISK_GB="${DISK_GB:-40}"
+  STORAGE="${STORAGE:-local-lvm}"      # storage for rootfs
+  BRIDGE="${BRIDGE:-vmbr0}"
+  TEMPLATE="${TEMPLATE:-}"             # empty = auto-pick newest Debian 12 template
+  SSH_PUBKEY="${SSH_PUBKEY:-}"         # optional override; empty = managed keypair
+  SSH_KEY_FILE="${SSH_KEY_FILE:-${STATE_DIR}/ssh/ai-sandbox}"   # shared by all instances
+  INSTANCE_DIR="${STATE_DIR}/${AGENT}"
+  MAC_FILE="${MAC_FILE:-${INSTANCE_DIR}/mac}"
+  CT_MAC="${CT_MAC:-}"                 # optional override; empty = managed MAC
+  SECRETS_FILE="${SECRETS_FILE:-${INSTANCE_DIR}/secrets.env}"
+  HOOK="${HOOK:-on}"                   # on = attach PVE hookscript (GUI trap)
+  CLOBBER="${CLOBBER:-discard}"        # discard | zero | off — post-stop rootfs wipe
+  EXPORT_DIR="${EXPORT_DIR:-/root/ai-sandbox-export/${AGENT}}"
+  LOCK_FILE="/run/lock/ai-sandbox.${AGENT}.lock"
+  GUARD_STAMP="/run/lock/ai-sandbox.${AGENT}.workguard-ok"
+  FORCE="${FORCE:-0}"                  # 1 = skip the work-loss guard prompt (still rescue-archives)
+  RESCUE="${RESCUE:-1}"                # 1 = vzdump before an approved guarded teardown
+  RESCUE_STORAGE="${RESCUE_STORAGE:-auto}"   # ordered storage IDs; "auto" = first with backup content
+  RESCUE_KEEP="${RESCUE_KEEP:-2}"      # rescue archives of this CT to keep
+  AGENT_HARDEN="${AGENT_HARDEN:-on}"   # on = inject the profile's default-deny config
+  AGENT_CONNECTORS="${AGENT_CONNECTORS:-off}"     # account/app connectors
+  AGENT_MCP="${AGENT_MCP:-off}"                   # MCP servers
+  AGENT_AUTO_APPROVE="${AGENT_AUTO_APPROVE:-off}" # auto-approve / YOLO / bypass modes
+  FIREWALL="${FIREWALL:-on}"           # on = attach PVE firewall=1 and write per-CT rules
+  EGRESS_POLICY="${EGRESS_POLICY:-lan-block}"     # lan-block | strict | off
+  EGRESS_ALLOW="${EGRESS_ALLOW:-}"     # optional comma-separated IPs/CIDRs allowed outbound
+  PROVISION_HOOKS=("$(dirname "$(readlink -f "$0")")/provision.sh" "${INSTANCE_DIR}/provision.sh")
+  [[ "$CTID" =~ ^[0-9]+$ ]] && [ "$CTID" -ge 100 ] || die "invalid CTID '$CTID'"
+}
+
+# --------------------------- agent profiles ----------------------------------
+# A profile is five functions named profile_<agent>_<part>:
+#   meta          set PROFILE_CTID, PROFILE_LABEL, PROFILE_VSCODE_EXT
+#   install       print a bash snippet that installs the CLI (runs in the CT
+#                 as root, after the base toolchain; /root/.local/bin is on PATH)
+#   verify        print the command that proves the CLI works (e.g. --version)
+#   credentials   push $SECRETS_FILE into the CT in the agent's native form
+#   policy        inject the default-deny config from AGENT_CONNECTORS,
+#                 AGENT_MCP and AGENT_AUTO_APPROVE (only when AGENT_HARDEN=on)
+#   credentials_hint   (optional) how to create $SECRETS_FILE, shown when absent
+# Helpers for profiles: ct_push_file <src> <dest> <mode>, bool_word on|off.
+
+# ---- mistral: Mistral Vibe CLI ----------------------------------------------
+profile_mistral_meta() {
+  PROFILE_CTID=1051
+  PROFILE_LABEL="Mistral Vibe CLI"
+  PROFILE_VSCODE_EXT="mistralai.mistral-vibe-code"
+}
+
+profile_mistral_install() {
+  cat <<'EOF'
+# current Vibe CLI, fetched at build time
+curl -LsSf https://mistral.ai/vibe/install.sh | bash
+# make the CLI reachable from non-login shells
+ln -sf /root/.local/bin/vibe     /usr/local/bin/vibe     2>/dev/null || true
+ln -sf /root/.local/bin/vibe-acp /usr/local/bin/vibe-acp 2>/dev/null || true
+EOF
+}
+
+profile_mistral_verify() { echo "vibe --version"; }
+
+# secrets.env holds MISTRAL_API_KEY=<key> (a *Vibe* key from chat.mistral.ai,
+# Code > Vibe CLI — a Studio key lacks the Vibe Code entitlement). The CLI
+# reads /root/.vibe/.env on startup.
+profile_mistral_credentials() {
+  ct_push_file "$SECRETS_FILE" /root/.vibe/.env 600
+  echo "credentials injected (host: $SECRETS_FILE -> CT: /root/.vibe/.env)"
+}
+
+profile_mistral_credentials_hint() {
+  echo "  create a Vibe key at chat.mistral.ai (Code > Vibe CLI), then run:"
+  echo "    printf 'MISTRAL_API_KEY=<key>\\n' > $SECRETS_FILE && chmod 600 $SECRETS_FILE"
+}
+
+profile_mistral_policy() {
+  local tmp
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+# Managed by ai-sandbox.sh — override at build time via AGENT_CONNECTORS /
+# AGENT_MCP / AGENT_AUTO_APPROVE, or AGENT_HARDEN=off to skip.
+enable_connectors = $(bool_word "$AGENT_CONNECTORS")
+enable_mcp = $(bool_word "$AGENT_MCP")
+enable_auto_approve = $(bool_word "$AGENT_AUTO_APPROVE")
+EOF
+  ct_push_file "$tmp" /root/.vibe/config.toml 400 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  echo "hardening: injected /root/.vibe/config.toml"
+}
+
 # --------------------------- helpers ---------------------------------------
-die() { echo "error: $*" >&2; exit 1; }
 
 lock_or_die() {
   exec 9>"$LOCK_FILE"
-  flock -n 9 || die "another vibe-sandbox operation is running (serial rebuild only)"
+  flock -n 9 || die "another ai-sandbox operation is running on the $AGENT sandbox (serial per agent)"
 }
 
 # Hook phases fire from INSIDE the pct call of the operation that already
@@ -196,7 +232,7 @@ hook_lock() {   # $1 = phase; rc 0 = lock acquired (do the work), rc 1 = passthr
   if flock -n 9; then
     return 0
   fi
-  echo "vibe-sandbox: operation in progress — $1 hook passthrough" >&2
+  echo "ai-sandbox: $AGENT operation in progress — $1 hook passthrough" >&2
   return 1
 }
 
@@ -209,7 +245,7 @@ hook_lock() {   # $1 = phase; rc 0 = lock acquired (do the work), rc 1 = passthr
 #   * stale -> install the current copy (bash -n validated, previous
 #     copy kept as $0.bak, atomic mv: a concurrently running instance
 #     keeps executing the old inode undisturbed) and re-exec ONCE
-#     (VIBE_SANDBOX_SELF_UPDATED guard), so the build that noticed the
+#     (AI_SANDBOX_SELF_UPDATED guard), so the build that noticed the
 #     drift runs current code.
 #   * the check never blocks: an unreachable URL, a timeout, or a
 #     fetched file that fails bash -n all degrade to a warning and the
@@ -236,7 +272,7 @@ install_current_script() {   # $1 = temp file holding the new script; echoes bac
 
 self_check() {   # "$@" = full original argv; installs + re-execs once if stale
   [ "$AUTO_UPDATE" = "on" ] || return 0
-  [ -z "${VIBE_SANDBOX_SELF_UPDATED:-}" ] || return 0
+  [ -z "${AI_SANDBOX_SELF_UPDATED:-}" ] || return 0
   local tmp bak
   tmp="$(mktemp 2>/dev/null)" || { echo "self-check: mktemp failed — skipping" >&2; return 0; }
   if ! fetch_current_script "$tmp" 15; then
@@ -251,7 +287,7 @@ self_check() {   # "$@" = full original argv; installs + re-execs once if stale
   bak="$(install_current_script "$tmp")"
   echo "self-update: local script was stale — installed the current copy from main"
   echo "  (previous copy: $bak); re-running on the new script"
-  export VIBE_SANDBOX_SELF_UPDATED=1
+  export AI_SANDBOX_SELF_UPDATED=1
   exec "$(readlink -f "$0")" "$@"
 }
 
@@ -267,7 +303,9 @@ ensure_ssh_key() {
     return 0
   fi
   if [ ! -f "$SSH_KEY_FILE" ]; then
-    ssh-keygen -t ed25519 -N "" -C "vibe-sandbox" -f "$SSH_KEY_FILE" >/dev/null
+    mkdir -p "$(dirname "$SSH_KEY_FILE")"
+    chmod 700 "$(dirname "$SSH_KEY_FILE")"
+    ssh-keygen -t ed25519 -N "" -C "ai-sandbox" -f "$SSH_KEY_FILE" >/dev/null
     echo "generated sandbox keypair (retained on host): $SSH_KEY_FILE"
   fi
   chmod 600 "$SSH_KEY_FILE"
@@ -286,6 +324,7 @@ ensure_mac() {
   else
     # locally administered unicast (02:xx:xx:xx:xx:xx), otherwise random
     CT_MAC="02:$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n' | sed 's/../&:/g;s/:$//')"
+    mkdir -p "$(dirname "$MAC_FILE")"
     printf '%s\n' "$CT_MAC" > "$MAC_FILE"
     chmod 600 "$MAC_FILE"
     echo "generated sandbox MAC (retained on host): $CT_MAC"
@@ -301,9 +340,33 @@ ensure_hook_snippet() {
   local self
   self="$(readlink -f "$0")"
   mkdir -p "$HOOK_SNIPPET_DIR"
-  printf '#!/usr/bin/env bash\n# vibe-sandbox PVE hookscript shim — auto-generated, safe to overwrite\nvmid="$1"; phase="$2"\nexec %q hook "$vmid" "$phase"\n' \
-    "$self" > "${HOOK_SNIPPET_DIR}/vibe-sandbox-hook.sh"
-  chmod +x "${HOOK_SNIPPET_DIR}/vibe-sandbox-hook.sh"
+  printf '#!/usr/bin/env bash\n# ai-sandbox PVE hookscript shim — auto-generated, safe to overwrite\n# one shim serves every agent instance; the script maps vmid -> agent\nvmid="$1"; phase="$2"\nexec %q hook "$vmid" "$phase"\n' \
+    "$self" > "${HOOK_SNIPPET_DIR}/ai-sandbox-hook.sh"
+  chmod +x "${HOOK_SNIPPET_DIR}/ai-sandbox-hook.sh"
+}
+
+# Setup shared by every instance (keypair, template download, hook shim),
+# serialised across instances with a SHORT blocking lock: per-agent locks
+# let two agents build in parallel, but they must not race the first-ever
+# keypair generation or the same template download. Holds no pct calls,
+# so a hook phase can never wait on it from inside its own operation.
+shared_setup() {
+  exec 8>"$SHARED_LOCK"
+  flock -w 900 8 || die "timed out waiting for shared setup lock $SHARED_LOCK"
+  ensure_ssh_key
+  [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
+  ensure_hook_snippet
+  flock -u 8
+  exec 8>&-
+}
+
+# Push a host file into the CT as root:root with the given mode, creating
+# the destination directory. For profiles' credentials/policy functions.
+ct_push_file() {   # $1 = host src, $2 = CT dest path, $3 = octal mode
+  pct exec "$CTID" -- mkdir -p "$(dirname "$2")" || return 1
+  pct push "$CTID" "$1" "$2" || return 1
+  pct exec "$CTID" -- chown root:root "$2" || return 1
+  pct exec "$CTID" -- chmod "$3" "$2"
 }
 
 template_auto() {
@@ -543,12 +606,12 @@ destroy_sandbox() {
 # --------------------------- connector & egress hardening --------------------
 # Isolating compute/filesystem does not contain information flow if outbound
 # connectors are enabled or if the CT can probe/reach internal LAN services.
-# Layer 1 (in-CT guardrail): deterministic /root/.vibe/config.toml disabling
-# connectors, MCP servers, and auto-approve by default.
+# Layer 1 (in-CT guardrail): the agent profile's default-deny config,
+# disabling connectors, MCP servers, and auto-approve by default.
 # Layer 2 (host boundary): Proxmox per-CT firewall ruleset enforced on the
 # hypervisor bridge — outside container root control.
 
-FW_MARKER="# vibe-sandbox managed firewall"
+FW_MARKER="# ai-sandbox managed firewall"
 
 validate_on_off() {   # $1 = var name, $2 = value
   case "$2" in
@@ -598,10 +661,10 @@ validate_cidr_or_ip() {   # $1 = token; strict IPv4/IPv6 or CIDR validation (blo
 }
 
 validate_hardening_config() {
-  validate_on_off VIBE_HARDEN "$VIBE_HARDEN"
-  validate_on_off VIBE_CONNECTORS "$VIBE_CONNECTORS"
-  validate_on_off VIBE_MCP "$VIBE_MCP"
-  validate_on_off VIBE_AUTO_APPROVE "$VIBE_AUTO_APPROVE"
+  validate_on_off AGENT_HARDEN "$AGENT_HARDEN"
+  validate_on_off AGENT_CONNECTORS "$AGENT_CONNECTORS"
+  validate_on_off AGENT_MCP "$AGENT_MCP"
+  validate_on_off AGENT_AUTO_APPROVE "$AGENT_AUTO_APPROVE"
   validate_on_off FIREWALL "$FIREWALL"
   case "$EGRESS_POLICY" in
     lan-block|strict|off) ;;
@@ -620,7 +683,7 @@ validate_hardening_config() {
   fi
 }
 
-bool_toml() {
+bool_word() {   # on|off -> true|false (valid in TOML and JSON alike)
   [ "$1" = "on" ] && echo "true" || echo "false"
 }
 
@@ -718,36 +781,18 @@ remove_firewall() {
   fi
 }
 
-render_vibe_config() {
-  cat <<EOF
-# Managed by vibe-sandbox.sh (Issue #40 connector hardening)
-# Override at build time via VIBE_CONNECTORS / VIBE_MCP / VIBE_AUTO_APPROVE / VIBE_HARDEN
-enable_connectors = $(bool_toml "$VIBE_CONNECTORS")
-enable_mcp = $(bool_toml "$VIBE_MCP")
-enable_auto_approve = $(bool_toml "$VIBE_AUTO_APPROVE")
-EOF
-}
-
-inject_vibe_config() {
-  if [ "$VIBE_HARDEN" != "on" ]; then
-    echo "hardening: VIBE_HARDEN=off — skipping /root/.vibe/config.toml injection"
+# Layer 1 dispatch: the agent profile renders and pushes its own
+# default-deny config. A failed push aborts the build (fail closed).
+inject_agent_policy() {
+  if [ "$AGENT_HARDEN" != "on" ]; then
+    echo "hardening: AGENT_HARDEN=off — skipping the $PROFILE_LABEL policy config"
     return 0
   fi
-  local cfg_tmp
-  cfg_tmp="$(mktemp)"
-  render_vibe_config > "$cfg_tmp"
-  if ! pct exec "$CTID" -- mkdir -p /root/.vibe || ! pct push "$CTID" "$cfg_tmp" /root/.vibe/config.toml; then
-    rm -f "$cfg_tmp"
-    return 1
-  fi
-  rm -f "$cfg_tmp"
-  pct exec "$CTID" -- chown root:root /root/.vibe/config.toml
-  pct exec "$CTID" -- chmod 400 /root/.vibe/config.toml
-  echo "hardening: injected /root/.vibe/config.toml (connectors=$VIBE_CONNECTORS, mcp=$VIBE_MCP, auto_approve=$VIBE_AUTO_APPROVE)"
+  "profile_${AGENT}_policy" || die "hardening: failed to inject the $PROFILE_LABEL policy config"
 }
 
 print_hardening_summary() {
-  local fw_state="off" vibe_state="off"
+  local fw_state="off" agent_state="off"
   if firewall_active; then
     if datacenter_firewall_enabled; then
       fw_state="${EGRESS_POLICY} (active)"
@@ -755,10 +800,10 @@ print_hardening_summary() {
       fw_state="${EGRESS_POLICY} (pending Datacenter firewall)"
     fi
   fi
-  if [ "$VIBE_HARDEN" = "on" ]; then
-    vibe_state="connectors=${VIBE_CONNECTORS}, mcp=${VIBE_MCP}, auto_approve=${VIBE_AUTO_APPROVE}"
+  if [ "$AGENT_HARDEN" = "on" ]; then
+    agent_state="connectors=${AGENT_CONNECTORS}, mcp=${AGENT_MCP}, auto_approve=${AGENT_AUTO_APPROVE}"
   fi
-  echo "hardening: firewall=${fw_state}; vibe=(${vibe_state})"
+  echo "hardening: firewall=${fw_state}; ${AGENT}=(${agent_state})"
 }
 
 # Create the sandbox CT. $1 = start | stopped. The hookscript is attached
@@ -818,17 +863,15 @@ park_sandbox() {
   ct_running && pct stop "$CTID"
   clobber_disk
   destroy_sandbox
-  ensure_ssh_key
-  [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
-  ensure_hook_snippet
+  shared_setup
   create_sandbox stopped
 }
 
-# Base provisioning script, executed INSIDE the fresh CT on every build.
-# A general-purpose baseline toolchain plus the CURRENT Vibe CLI (always the
-# latest release at build time — no pinning, by design). Anything beyond
-# this, the agent installs itself at runtime over the open outbound net.
-provision_base_script() {
+# Provisioning script, executed INSIDE the fresh CT on every build: an
+# agent-neutral baseline, then the profile's install snippet (current CLI
+# release at build time — no pinning, by design), then its verify command.
+# Anything beyond this, the agent installs itself at runtime.
+provision_script() {
   cat <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -838,9 +881,10 @@ export DEBIAN_FRONTEND=noninteractive
 # usually not compiled into the fresh CT, so apt/perl would spam
 # warnings; use C here
 export LC_ALL=C
-# uv installs the CLI into /root/.local/bin, which is NOT on the PATH
-# of the pct-exec context — the installer treats that as fatal, and
-# `vibe --version` below would fail the same way — so put it up front
+# user-level installers (uv, the native Claude/other installers) put CLIs
+# in /root/.local/bin, which is NOT on the PATH of the pct-exec context —
+# some installers treat that as fatal, and the verify step would fail the
+# same way — so put it up front
 export PATH="/root/.local/bin:$PATH"
 
 # general-purpose baseline: the agent extends this at runtime as needed
@@ -855,50 +899,44 @@ apt-get install -y -qq --no-install-recommends \
 # warning and the CT matches the host, whatever LANG says
 [ -n "${LANG:-}" ] && locale-gen "$LANG" >/dev/null 2>&1 || true
 
-# current iteration of Mistral tooling, fetched at build time
-curl -LsSf https://mistral.ai/vibe/install.sh | bash
-
-# make the CLI reachable from non-login shells
-ln -sf /root/.local/bin/vibe     /usr/local/bin/vibe     2>/dev/null || true
-ln -sf /root/.local/bin/vibe-acp /usr/local/bin/vibe-acp 2>/dev/null || true
-
 # root access is by the injected keypair ONLY: the template ships root's
 # password locked and the script never sets one; pin key-only root login
 # explicitly (the Debian default, made unconditional here) so a template
 # change can never quietly enable password auth. Needs the template's
 # Include of sshd_config.d (Debian ships it).
 mkdir -p /etc/ssh/sshd_config.d
-printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/10-vibe-root-key-only.conf
+printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/10-ai-sandbox-root-key-only.conf
 sshd -t && systemctl reload ssh >/dev/null 2>&1 || true
 
-vibe --version
+# ---- agent profile: install ----
 EOF
+  "profile_${AGENT}_install"
+  echo
+  echo "# ---- agent profile: verify ----"
+  "profile_${AGENT}_verify"
 }
 
-# Re-inject the permanent credential store into the fresh CT.
-# The CLI reads /root/.vibe/.env automatically on startup; shell env vars
-# take precedence over it, but the sandbox sets none, so this is the source.
+# Re-inject the agent's permanent credential store into the fresh CT, in
+# whatever form its profile wants (env file, settings, token file...).
 inject_credentials() {
   if [ ! -f "$SECRETS_FILE" ]; then
-    echo "warning: no key store at $SECRETS_FILE — CLI will need the setup wizard" >&2
-    echo "  create a key at chat.mistral.ai (Code > Vibe CLI), then run:" >&2
-    echo "    printf 'MISTRAL_API_KEY=<key>\n' > $SECRETS_FILE && chmod 600 $SECRETS_FILE" >&2
+    echo "warning: no credential store at $SECRETS_FILE — $PROFILE_LABEL will need its own sign-in" >&2
+    if declare -F "profile_${AGENT}_credentials_hint" >/dev/null; then
+      "profile_${AGENT}_credentials_hint" >&2
+    fi
     return 0
   fi
   [ "$(stat -c %a "$SECRETS_FILE")" = "600" ] || chmod 600 "$SECRETS_FILE"
-  pct exec "$CTID" -- mkdir -p /root/.vibe
-  pct push "$CTID" "$SECRETS_FILE" /root/.vibe/.env
-  pct exec "$CTID" -- chown root:root /root/.vibe/.env
-  pct exec "$CTID" -- chmod 600 /root/.vibe/.env
-  echo "credentials injected (host: $SECRETS_FILE -> CT: /root/.vibe/.env)"
+  "profile_${AGENT}_credentials" || die "failed to inject credentials for $PROFILE_LABEL"
 }
 
-# Shared post-build provisioning: base toolchain + CLI + credentials + hook.
+# Shared post-build provisioning: baseline + agent CLI + credentials +
+# policy + optional user hooks (script dir, then the instance dir).
 provision_and_report() {
-  echo "provisioning base toolchain and Vibe CLI ..."
-  local prov
+  echo "provisioning base toolchain and $PROFILE_LABEL ..."
+  local prov hook
   prov="$(mktemp)"
-  provision_base_script > "$prov"
+  provision_script > "$prov"
   pct push "$CTID" "$prov" /root/provision-base.sh
   pct exec "$CTID" -- bash /root/provision-base.sh
   rm -f "$prov"
@@ -906,14 +944,16 @@ provision_and_report() {
   # permanent credential store -> fresh CT, every build
   inject_credentials
 
-  # hardened Vibe CLI config (default-deny connectors, MCP, auto-approve)
-  inject_vibe_config
+  # default-deny agent config (connectors, MCP, auto-approve)
+  inject_agent_policy
 
-  # user hook (deterministic per-use extras), if present
-  if [ -f "$PROVISION_HOOK" ]; then
-    pct push "$CTID" "$PROVISION_HOOK" /root/provision.sh
+  # user hooks (deterministic per-use extras), if present
+  for hook in "${PROVISION_HOOKS[@]}"; do
+    [ -f "$hook" ] || continue
+    echo "running user provisioning hook $hook ..."
+    pct push "$CTID" "$hook" /root/provision.sh
     pct exec "$CTID" -- bash /root/provision.sh
-  fi
+  done
 }
 
 print_ssh_line() {
@@ -937,18 +977,16 @@ purge_known_hosts() {   # $1 = sandbox IP
 
 # --------------------------- subcommands ------------------------------------
 cmd_up() {
-  self_check up
+  self_check up "$AGENT"
   lock_or_die
   validate_hardening_config
   # AUTO REBUILD: never resume — tear down any prior sandbox first
   destroy_sandbox
 
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
-  ensure_ssh_key
-  [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
-  ensure_hook_snippet
+  shared_setup
 
-  echo "building CT $CTID from $TEMPLATE ..."
+  echo "building $AGENT sandbox (CT $CTID, $PROFILE_LABEL) from $TEMPLATE ..."
   create_sandbox start
 
   local ip
@@ -971,8 +1009,8 @@ cmd_down() {
   validate_hardening_config
   work_guard down || die "work guard: refusing to park CT $CTID"
   park_sandbox
-  echo "sandbox parked: disk clobbered (CLOBBER=$CLOBBER), fresh stub at CT $CTID."
-  echo "  right-click Start in the Proxmox GUI, or run 'up', for the next session."
+  echo "$AGENT sandbox parked: disk clobbered (CLOBBER=$CLOBBER), fresh stub at CT $CTID."
+  echo "  right-click Start in the Proxmox GUI, or run '$0 up $AGENT', for the next session."
 }
 
 cmd_purge() {
@@ -981,7 +1019,7 @@ cmd_purge() {
   ct_running && pct stop "$CTID"
   destroy_sandbox
   remove_firewall
-  echo "CT $CTID removed entirely (no stub left in the tree)."
+  echo "CT $CTID ($AGENT) removed entirely (no stub left in the tree)."
 }
 
 # Desktop bundle: copy the managed keypair + an ssh-config snippet +
@@ -1005,20 +1043,20 @@ cmd_export() {
 
   mkdir -p "$EXPORT_DIR"
   chmod 700 "$EXPORT_DIR"
-  cp "$SSH_KEY_FILE" "$EXPORT_DIR/vibe-sandbox"
-  cp "${SSH_KEY_FILE}.pub" "$EXPORT_DIR/vibe-sandbox.pub"
-  chmod 600 "$EXPORT_DIR/vibe-sandbox"
-  chmod 644 "$EXPORT_DIR/vibe-sandbox.pub"
+  cp "$SSH_KEY_FILE" "$EXPORT_DIR/ai-sandbox"
+  cp "${SSH_KEY_FILE}.pub" "$EXPORT_DIR/ai-sandbox.pub"
+  chmod 600 "$EXPORT_DIR/ai-sandbox"
+  chmod 644 "$EXPORT_DIR/ai-sandbox.pub"
 
   cat > "$EXPORT_DIR/ssh-config" <<EOF
-# vibe-sandbox — append to ~/.ssh/config (Linux/macOS)
+# ${CTHOST} — append to ~/.ssh/config (Linux/macOS)
 # or %USERPROFILE%\.ssh\config (Windows). HostName goes stale after each
 # rebuild UNLESS you set a DHCP reservation for the sandbox MAC (see
 # README.txt) — the MAC is permanent, so the reservation holds forever.
-Host vibe-sandbox
+Host ${CTHOST}
     HostName $ip
     User root
-    IdentityFile ~/.ssh/vibe-sandbox
+    IdentityFile ~/.ssh/ai-sandbox
     # disposable sandbox: every rebuild mints a FRESH host key, so
     # strict known-hosts checking would block the 2nd+ rebuild connect.
     # Scoped to this Host alias only — never copy it to other hosts.
@@ -1027,18 +1065,20 @@ Host vibe-sandbox
 EOF
 
   cat > "$EXPORT_DIR/README.txt" <<EOF
-vibe-sandbox desktop bundle (exported $(date '+%Y-%m-%d %H:%M'), CT $CTID)
+${CTHOST} desktop bundle (exported $(date '+%Y-%m-%d %H:%M'), CT $CTID)
 ======================================================================
 
 Use the sandbox from your desktop instead of the Proxmox console.
 
 Contents:
-  vibe-sandbox        private key (copy of the host-managed sandbox keypair)
-  vibe-sandbox.pub    public key
-  ssh-config          ssh config snippet -> 'ssh vibe-sandbox'
+  ai-sandbox        private key (copy of the host-managed sandbox keypair)
+  ai-sandbox.pub      public key
+  ssh-config          ssh config snippet -> 'ssh ${CTHOST}'
   README.txt          this file
 
-The keypair is permanent: one export unlocks every future rebuild.
+The keypair is permanent and shared by every ai-sandbox agent instance:
+one export unlocks every future rebuild; exports for other agents only
+add their own Host block to ssh-config.
 
 FIX THE IP (recommended)
 ------------------------
@@ -1047,7 +1087,7 @@ FIX THE IP (recommended)
   pfSense/OPNsense, Pi-hole, whatever hands out addresses):
     ${mac:-unknown}
   With that reservation, the IP below never goes stale and 'ssh
-  vibe-sandbox' just works after every rebuild. Without it, only the
+  ${CTHOST}' just works after every rebuild. Without it, only the
   HostName (IP) goes stale per rebuild — re-run 'export' on the host and
   re-fetch, or edit the HostName line in your ssh config.
 
@@ -1056,17 +1096,17 @@ Current sandbox IP: $ip
 Linux / macOS
 -------------
   mkdir -p ~/.ssh && chmod 700 ~/.ssh
-  cp vibe-sandbox vibe-sandbox.pub ~/.ssh/
+  cp ai-sandbox ai-sandbox.pub ~/.ssh/
   cat ssh-config >> ~/.ssh/config
-  ssh vibe-sandbox
+  ssh ${CTHOST}
 
 Windows 10+ (built-in OpenSSH; PowerShell or CMD)
 -------------------------------------------------
   if not exist "%USERPROFILE%\.ssh" mkdir "%USERPROFILE%\.ssh"
-  copy vibe-sandbox "%USERPROFILE%\.ssh\vibe-sandbox"
-  copy vibe-sandbox.pub "%USERPROFILE%\.ssh\vibe-sandbox.pub"
+  copy ai-sandbox "%USERPROFILE%\.ssh\ai-sandbox"
+  copy ai-sandbox.pub "%USERPROFILE%\.ssh\ai-sandbox.pub"
   type ssh-config >> "%USERPROFILE%\.ssh\config"
-  ssh vibe-sandbox
+  ssh ${CTHOST}
 
   (no 'ssh' command? Settings > Apps > Optional features > OpenSSH Client,
   then reopen the terminal)
@@ -1075,7 +1115,7 @@ REBUILDS AND HOST KEYS
 ----------------------
   Every rebuild mints a fresh SSH host key for the sandbox. The bundled
   ssh-config pins StrictHostKeyChecking no + UserKnownHostsFile /dev/null
-  for this one Host, so 'ssh vibe-sandbox' just works after every rebuild.
+  for this one Host, so 'ssh ${CTHOST}' just works after every rebuild.
   (Windows OpenSSH maps /dev/null to NUL; if your ssh rejects the line,
   write NUL there instead.) With a hand-rolled config, expect REMOTE HOST
   IDENTIFICATION HAS CHANGED after each rebuild — expected rotation,
@@ -1084,38 +1124,54 @@ REBUILDS AND HOST KEYS
 
 PuTTY instead of OpenSSH
 ------------------------
-  puttygen "%USERPROFILE%\.ssh\vibe-sandbox" -o vibe-sandbox.ppk
+  puttygen "%USERPROFILE%\.ssh\ai-sandbox" -o ai-sandbox.ppk
   Host Name: $ip   Port: 22   User: root
-  (load vibe-sandbox.ppk under Connection > SSH > Auth > Credentials)
+  (load ai-sandbox.ppk under Connection > SSH > Auth > Credentials)
   (each rebuild mints a fresh host key — accept it when PuTTY asks)
 
 Security
 --------
   The private key now also lives on this desktop. It is a dedicated
-  sandbox keypair — it unlocks the sandbox (every future rebuild too),
-  not the Proxmox host. After fetching the tarball, delete the host-side
+  sandbox keypair — it unlocks every ai-sandbox instance (every future
+  rebuild too), not the Proxmox host. After fetching the tarball, delete the host-side
   copy so the key lives only on host and desktop:
     rm -rf $EXPORT_DIR
 EOF
 
-  tar -czf "$EXPORT_DIR/vibe-sandbox-desktop.tar.gz" \
-      -C "$EXPORT_DIR" vibe-sandbox vibe-sandbox.pub ssh-config README.txt
-  chmod 600 "$EXPORT_DIR/vibe-sandbox-desktop.tar.gz"
+  tar -czf "$EXPORT_DIR/ai-sandbox-${AGENT}-desktop.tar.gz" \
+      -C "$EXPORT_DIR" ai-sandbox ai-sandbox.pub ssh-config README.txt
+  chmod 600 "$EXPORT_DIR/ai-sandbox-${AGENT}-desktop.tar.gz"
 
   echo "desktop bundle written to $EXPORT_DIR"
   echo "  fetch from your desktop (host SSH must be reachable from your LAN):"
-  echo "    scp root@${hostip}:$EXPORT_DIR/vibe-sandbox-desktop.tar.gz ."
+  echo "    scp root@${hostip}:$EXPORT_DIR/ai-sandbox-${AGENT}-desktop.tar.gz ."
   if [ "$(hostname -I | wc -w)" -gt 1 ]; then
     echo "  note: this host is multi-homed ($(hostname -I | awk '{$1=$1};1')) —"
     echo "  if $hostip is not reachable from your desktop, rerun with:"
-    echo "    HOST_IP=<reachable-address> $0 export"
+    echo "    HOST_IP=<reachable-address> $0 export $AGENT"
   fi
-  echo "  then follow the README.txt inside; connect with: ssh vibe-sandbox"
+  echo "  then follow the README.txt inside; connect with: ssh ${CTHOST}"
   echo "recommended: set a DHCP reservation for the sandbox MAC ${mac:-unknown} —"
   echo "  it is retained across rebuilds, so the IP stays stable forever"
   echo "note: without a reservation, re-run 'export' after each rebuild — only the IP changes; the key is permanent"
   echo "note: rebuilds mint a fresh host key; the bundled ssh-config pins"
   echo "  StrictHostKeyChecking no for the sandbox Host, so desktop connects survive rebuilds"
+  if [ -n "${PROFILE_VSCODE_EXT:-}" ]; then
+    echo "VS Code Remote-SSH: add the $PROFILE_LABEL extension to your desktop settings.json"
+    echo "  so it installs itself on every connect: \"remote.SSH.defaultExtensions\": [\"$PROFILE_VSCODE_EXT\"]"
+  fi
+}
+
+# Map a hookscript vmid back to its agent instance. The hook shim is shared
+# by every instance and PVE runs it WITHOUT the caller's environment, so the
+# CT's own hostname (ai-sandbox-<agent>) is the source of truth; settings
+# come from the config files. Not ours -> empty, and the hook does nothing.
+hook_agent_for() {   # $1 = vmid; echoes agent or nothing
+  local host agent
+  host="$(pct config "$1" 2>/dev/null | awk '/^hostname:/ {print $2}')" || return 0
+  agent="${host#ai-sandbox-}"
+  [ "$agent" != "$host" ] && profile_exists "$agent" && echo "$agent"
+  return 0
 }
 
 # INTERNAL: entry point for the PVE hookscript shim. PVE calls the shim with
@@ -1127,34 +1183,38 @@ EOF
 # All destructive phases go through guard_ct(): if the CT at $CTID is not
 # provably ours, the hook ABORTS the GUI task instead of touching it.
 # Hook phases lock with hook_lock(), never lock_or_die: a phase can fire
-# from inside `up`'s or `down`'s own pct call, which already holds the
-# serial lock. Lock free -> standalone/GUI task, this hook does the
+# from inside `up`'s or `down`'s own pct call, which already holds that
+# agent's lock. Lock free -> standalone/GUI task, this hook does the
 # phase's work; lock held -> the holder is the triggering operation and
-# does the work itself, this hook passes through with exit 0.
+# does the work itself, this hook passes through with exit 0. Locks are
+# per agent, so another agent's build never makes this one pass through.
 cmd_hook() {
-  local vmid="${1:-}" phase="${2:-}"
-  [ "$vmid" = "$CTID" ] || exit 0
+  local vmid="${1:-}" phase="${2:-}" agent
+  [[ "$vmid" =~ ^[0-9]+$ ]] || exit 0
+  agent="$(hook_agent_for "$vmid")"
+  [ -n "$agent" ] || exit 0
+  CTID="$vmid"
+  select_agent "$agent"
   case "$phase" in
     pre-start)
       self_check hook "$vmid" "$phase"
       hook_lock "$phase" || exit 0
       validate_hardening_config
-      echo "pre-start: rebuilding CT $CTID fresh"
+      echo "pre-start: rebuilding $AGENT sandbox CT $CTID fresh"
       destroy_sandbox
-      ensure_ssh_key
-      [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
-      ensure_hook_snippet
+      shared_setup
       create_sandbox stopped
       ;;  # PVE now starts the newly created CT
     post-start)
       hook_lock "$phase" || exit 0
+      guard_ct
       local ip
       ip="$(wait_for_ip)" || { echo "post-start: no IP (check ${BRIDGE}/DHCP)"; exit 0; }
       purge_known_hosts "$ip"
       provision_and_report
       print_hardening_summary
       warn_datacenter_firewall
-      echo "sandbox ready via GUI."
+      echo "$AGENT sandbox ready via GUI."
       print_ssh_line "$ip"
       ;;
     pre-stop)
@@ -1167,7 +1227,7 @@ cmd_hook() {
     post-stop)
       hook_lock "$phase" || exit 0
       park_sandbox
-      echo "post-stop: sandbox clobbered and parked as a fresh stub (CT $CTID)"
+      echo "post-stop: $AGENT sandbox clobbered and parked as a fresh stub (CT $CTID)"
       ;;
     *)
       exit 0 ;;
@@ -1185,16 +1245,39 @@ cmd_status() {
       fw_info="${pol:-custom} (Datacenter firewall OFF)"
     fi
   fi
-  if ! ct_exists; then echo "no sandbox (CT $CTID absent)"; exit 0; fi
+  if ! ct_exists; then echo "$AGENT: no sandbox (CT $CTID absent)"; exit 0; fi
   if ct_running; then
-    echo "CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
+    echo "$AGENT: CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
   else
-    echo "CT $CTID exists but stopped (stub or unprovisioned), firewall: ${fw_info}"
+    echo "$AGENT: CT $CTID exists but stopped (stub or unprovisioned), firewall: ${fw_info}"
   fi
 }
 
+# Every ai-sandbox CT on this node, whichever agent and CTID.
+cmd_status_all() {
+  local vmid host state ip found=0
+  printf '%-10s %-6s %-8s %s\n' AGENT CTID STATE IP
+  for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    host="$(pct config "$vmid" 2>/dev/null | awk '/^hostname:/ {print $2}')"
+    case "$host" in ai-sandbox-?*) ;; *) continue ;; esac
+    found=1
+    state="$(pct status "$vmid" 2>/dev/null | awk '{print $2}')"
+    ip=""
+    [ "$state" = "running" ] && ip="$(pct exec "$vmid" -- sh -c 'hostname -I 2>/dev/null | cut -d" " -f1' 2>/dev/null || true)"
+    printf '%-10s %-6s %-8s %s\n' "${host#ai-sandbox-}" "$vmid" "${state:-?}" "${ip:--}"
+  done
+  [ "$found" = 1 ] || echo "(no ai-sandbox CTs on this node)"
+}
+
+cmd_agents() {
+  local a
+  for a in $(list_profiles); do
+    ( "profile_${a}_meta"; printf '%-10s CT %-6s %s\n' "$a" "$PROFILE_CTID" "$PROFILE_LABEL" )
+  done
+}
+
 cmd_shell() {
-  ct_running || die "sandbox not running; run 'up' first"
+  ct_running || die "$AGENT sandbox not running; run '$0 up $AGENT' first"
   pct enter "$CTID"
 }
 
@@ -1217,27 +1300,34 @@ cmd_update() {
 }
 
 # --------------------------- dispatch ---------------------------------------
-case "${1:-}" in
-  up)     shift; cmd_up ;;
-  down)   shift; cmd_down ;;
-  purge)  shift; cmd_purge ;;
-  reset)  shift; cmd_down; cmd_up ;;
-  status) shift; cmd_status ;;
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  up|down|purge|reset|shell|ip|export) select_agent "${1:-}" ;;
+  status) [ -z "${1:-${AGENT:-}}" ] || select_agent "${1:-}" ;;
+esac
+case "$cmd" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  purge)  cmd_purge ;;
+  reset)  cmd_down; cmd_up ;;
+  status) if [ -n "${AGENT:-}" ]; then cmd_status; else cmd_status_all; fi ;;
   ip)     sandbox_ip ;;
-  shell)  shift; cmd_shell ;;
-  export) shift; cmd_export ;;
-  update)  shift; cmd_update ;;
-  hook)   shift; cmd_hook "$@" ;;
+  shell)  cmd_shell ;;
+  export) cmd_export ;;
+  agents) cmd_agents ;;
+  update) cmd_update ;;
+  hook)   cmd_hook "$@" ;;
   *) awk '/^set -/ {exit} /^#/ {print}' "$0"; exit 1 ;;
 esac
 
-# --------------------------- auto-rebuild-on-boot (optional) -----------------
-# To make the Proxmox host rebuild the sandbox on every host boot, save as
-# /etc/cron.d/vibe-sandbox (rebuilds even if a stale CT survived a crash):
+# --------------------------- usage patterns (optional) -----------------------
+# Rebuild a sandbox on every host boot (even if a stale CT survived a crash):
+# save as /etc/cron.d/ai-sandbox
 #
-#   @root /root/vibe-sandbox.sh up >> /var/log/vibe-sandbox.log 2>&1
+#   @reboot root /root/ai-sandbox.sh up mistral >> /var/log/ai-sandbox.log 2>&1
 #
-# For an on-demand session model instead (recommended for single-use):
-# pair `up` before the agent starts and `down` after review, e.g. a wrapper:
+# Or an on-demand session (recommended for single-use): `up` before the
+# agent starts, `down` after review:
 #
-#   vibe-sandbox.sh up && ssh -i /root/.vibe-sandbox-ssh root@$(vibe-sandbox.sh ip) ; vibe-sandbox.sh down
+#   ai-sandbox.sh up claude && ssh -i /root/.ai-sandbox/ssh/ai-sandbox root@$(ai-sandbox.sh ip claude) ; ai-sandbox.sh down claude
