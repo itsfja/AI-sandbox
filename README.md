@@ -695,7 +695,10 @@ PVE hookscript.)
 - `another ai-sandbox operation is running on the <agent> sandbox` — a
   build or teardown of that agent is in progress; operations are serial
   per agent by design. Other agents are unaffected.
-- `clobber: blkdiscard failed` — rotational storage; use `CLOBBER=zero`.
+- `clobber: blkdiscard failed on <dev>: <reason>` — the volume could not
+  be discarded (the reason is blkdiscard's own message; for example
+  storage without discard support). Set `CLOBBER=zero` in the agent's
+  config.env to overwrite instead.
 - `refusing to touch CT <id>: it is not this script's sandbox` — the
   ownership guard fired: something else sits at that agent's CTID. Move
   it, or set the agent's `CTID` to a free ID in its config.env.
