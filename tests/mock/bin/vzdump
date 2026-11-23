@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+echo "vzdump $*" >> "$MOCK_T/calls.log"
+[ "$1" = path ] && echo /dev/mock-thin-$RANDOM
+exit 0

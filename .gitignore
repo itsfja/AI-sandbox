@@ -1,0 +1,12 @@
+# host-side credential stores — never commit
+secrets.env
+*.env
+.env
+
+# host-side sandbox SSH keypair — never commit
+ai-sandbox
+ai-sandbox.pub
+/ssh/
+
+# desktop export bundles
+*-desktop.tar.gz
