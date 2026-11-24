@@ -127,6 +127,7 @@ SHARED_LOCK="/run/lock/ai-sandbox.shared.lock"   # template/key/hook setup acros
 GUARD_STAMP_TTL=600                   # seconds a work-guard pass remains valid
 STORAGE_CFG="${STORAGE_CFG:-/etc/pve/storage.cfg}"  # storage definitions (content/path lookup)
 FW_DIR="${FW_DIR:-/etc/pve/firewall}" # Proxmox firewall config dir (contains cluster.fw & <CTID>.fw)
+PVE_LXC_DIR="${PVE_LXC_DIR:-/etc/pve/lxc}"  # this node's CT configs (read directly; see ct_conf)
 
 apply_defaults() {
   CTID="${CTID:-$PROFILE_CTID}"        # fixed ID per agent = one sandbox per agent
@@ -398,7 +399,6 @@ shared_setup() {
   exec 8>"$SHARED_LOCK"
   flock -w 900 8 || die "timed out waiting for shared setup lock $SHARED_LOCK"
   ensure_ssh_key
-  [ -n "$TEMPLATE" ] || TEMPLATE="$(template_auto)"
   ensure_hook_snippet
   flock -u 8
   exec 8>&-
@@ -412,7 +412,7 @@ shared_setup() {
 # started; env -i makes CLI `up` and GUI Start provision identically.
 CT_ENV=(env -i HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TERM=dumb
   LANG=C.UTF-8 PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
-ct_run() { pct exec "$CTID" -- "${CT_ENV[@]}" "$@"; }
+ct_run() { ct_attach "$CTID" "${CT_ENV[@]}" "$@"; }
 
 # Copy a host file into the CT as root:root with the given mode, creating
 # the destination directory. Streams the file through `pct exec` (stdin)
@@ -443,11 +443,68 @@ template_auto() {
   echo "local:vztmpl/${t##*/}"
 }
 
-ct_exists()  { pct status "$CTID" >/dev/null 2>&1; }
-ct_running() { [ "$(pct status "$CTID" 2>/dev/null | awk '{print $2}')" = "running" ]; }
+# Read-only queries go around `pct`: every pct call loads Proxmox's Perl
+# libraries, about 2.5 s each on pve1 (an `up` made ~25 of them). Reads use
+# what pct itself uses underneath: the config file, lxc-info, lxc-attach.
+# Anything that CHANGES a CT (create/clone/set/start/stop/destroy/template)
+# still goes through pct, for Proxmox's locking and bookkeeping.
+ct_conf() {   # $1 = CTID; prints its current config (no snapshot/pending sections); rc 1 if absent
+  local f="${PVE_LXC_DIR}/${1}.conf"
+  [ -f "$f" ] || return 1
+  awk '/^\[/ {exit} {print}' "$f"
+}
+
+ct_list() {   # CTIDs configured on this node
+  local f
+  for f in "$PVE_LXC_DIR"/*.conf; do
+    [ -e "$f" ] || continue
+    f="${f##*/}"; f="${f%.conf}"
+    [[ "$f" =~ ^[0-9]+$ ]] && echo "$f"
+  done
+  return 0
+}
+
+ct_id_running() {   # $1 = CTID; lxc's view, as pct status uses (mid-Stop it still runs)
+  case "$(lxc-info -n "$1" -sH 2>/dev/null)" in
+    ''|STOPPED) return 1 ;;
+  esac
+  return 0
+}
+
+ct_attach() {   # $1 = CTID, then the command; like `pct exec`, minus the Perl start-up
+  local id="$1"
+  shift
+  lxc-attach -n "$id" --clear-env -- "$@"
+}
+
+ct_exists()  { [ -f "${PVE_LXC_DIR}/${CTID}.conf" ]; }
+ct_running() { ct_id_running "$CTID"; }
 
 sandbox_ip() {
-  pct exec "$CTID" -- sh -c 'hostname -I 2>/dev/null | cut -d" " -f1' 2>/dev/null || true
+  ct_attach "$CTID" sh -c 'hostname -I 2>/dev/null | cut -d" " -f1' 2>/dev/null || true
+}
+
+# Block device of a volume: lvm/lvmthin from storage.cfg's vgname (instant),
+# anything else through pvesm (Perl, slow).
+volid_dev() {   # $1 = <storage>:<volume>
+  local store="${1%%:*}" vol="${1#*:}" vg
+  case "$(storage_type "$store")" in
+    lvm|lvmthin)
+      vg="$(storage_cfg_value "$store" vgname)"
+      [ -n "$vg" ] && { echo "/dev/${vg}/${vol}"; return 0; } ;;
+  esac
+  pvesm path "$1" 2>/dev/null
+}
+
+# The Debian template is only needed for a full build (rebuild, bake);
+# looking it up costs several pveam (Perl) calls and a network refresh.
+ensure_template() {
+  [ -n "$TEMPLATE" ] && return 0
+  exec 8>"$SHARED_LOCK"
+  flock -w 900 8 || die "timed out waiting for shared setup lock $SHARED_LOCK"
+  TEMPLATE="$(template_auto)"
+  flock -u 8
+  exec 8>&-
 }
 
 wait_for_ip() {
@@ -635,7 +692,7 @@ work_guard() {   # $1 = teardown label (up|down|purge|pre-stop); fail-closed
 guard_ct() {
   ct_exists || return 0
   local cfg hostname tags
-  cfg="$(pct config "$CTID")"
+  cfg="$(ct_conf "$CTID")"
   hostname="$(echo "$cfg" | awk '/^hostname:/ {print $2}')"
   tags="$(echo "$cfg" | awk '/^tags:/ {print $2}')"
   if [ "$hostname" = "$CTHOST" ] && echo "$tags" | grep -qw "$SANDBOX_TAG"; then
@@ -924,6 +981,8 @@ create_sandbox() {
     clone_sandbox "$golden" "${1:-start}" "$net0_opts" "${hookargs[@]}"
     return 0
   fi
+  ensure_template
+  echo "full build from $TEMPLATE ..."
   [ "${1:-start}" = "start" ] && startargs=(--start 1)
   pct create "$CTID" "$TEMPLATE" \
     --hostname "$CTHOST" \
@@ -959,7 +1018,7 @@ validate_spawn_config() {
 
 golden_usable() {   # $1 = golden CTID; rc 0 when it is a template with $AGENT baked in
   local cfg agents
-  cfg="$(pct config "$1" 2>/dev/null)" || return 1
+  cfg="$(ct_conf "$1")" || return 1
   grep -q '^hostname: ai-sandbox-golden$' <<<"$cfg" && grep -q '^template: 1$' <<<"$cfg" || return 1
   agents="$(sed -n 's/.* agents=\([^ ]*\).*/\1/p' "${STATE_DIR}/golden/stamp" 2>/dev/null | head -n1)"
   [[ ",${agents}," == *",${AGENT},"* ]]
@@ -996,7 +1055,7 @@ clone_sandbox() {   # $1 = golden CTID, $2 = start|stopped, $3 = net0, "${@:4}" 
     --onboot 0 \
     "$@"
   # the clone has the golden's disk size; grow it if this agent wants more
-  size="$(pct config "$CTID" | sed -n 's/^rootfs: .*size=\([0-9]*\)G.*/\1/p')"
+  size="$(ct_conf "$CTID" | sed -n 's/^rootfs: .*size=\([0-9]*\)G.*/\1/p')"
   if [ -n "$size" ] && [ "$DISK_GB" -gt "$size" ]; then
     pct resize "$CTID" rootfs "${DISK_GB}G"
   elif [ -n "$size" ] && [ "$DISK_GB" -lt "$size" ]; then
@@ -1013,13 +1072,13 @@ clone_sandbox() {   # $1 = golden CTID, $2 = start|stopped, $3 = net0, "${@:4}" 
 # "vm-<ctid>-disk-N" (seen on pve1); only its LVM origin is the base.
 ct_golden_base() {   # $1 = CTID (default $CTID); echoes the template CTID, if any
   local id="${1:-$CTID}" volid dev origin
-  volid="$(pct config "$id" 2>/dev/null | sed -n 's/^rootfs: \([^,]*\).*/\1/p' | head -n1)"
+  volid="$(ct_conf "$id" | sed -n 's/^rootfs: \([^,]*\).*/\1/p' | head -n1)"
   [ -n "$volid" ] || return 0
   if [[ "$volid" =~ :base-([0-9]+)-disk-[0-9]+/ ]]; then
     echo "${BASH_REMATCH[1]}"
     return 0
   fi
-  dev="$(pvesm path "$volid" 2>/dev/null)" || return 0
+  dev="$(volid_dev "$volid")" || return 0
   [[ "$dev" == /dev/* ]] || return 0
   origin="$(lvs --noheadings -o origin "$dev" 2>/dev/null | tr -d ' ')"
   [[ "$origin" =~ ^base-([0-9]+)-disk-[0-9]+$ ]] && echo "${BASH_REMATCH[1]}"
@@ -1079,10 +1138,10 @@ clobber_disk() {
   [ "$CLOBBER" = "off" ] && return 0
   guard_ct   # ownership interlock: never wipe a CT that is not ours
   local line volid dev
-  line="$(pct config "$CTID" 2>/dev/null | awk '/^rootfs:/')" || true
+  line="$(ct_conf "$CTID" | awk '/^rootfs:/')" || true
   volid="$(echo "$line" | cut -d' ' -f2 | cut -d, -f1)"
   [ -n "$volid" ] || { echo "clobber: no rootfs volid found, skipping"; return 0; }
-  dev="$(pvesm path "$volid" 2>/dev/null || true)"
+  dev="$(volid_dev "$volid" || true)"
   case "$dev" in
     /dev/*) ;;
     *) echo "clobber: $volid is not /dev-backed ($dev) - skipping wipe" >&2; return 0 ;;
@@ -1216,7 +1275,7 @@ stub_is_pristine() {
 # pre-start cannot do under Proxmox's lock.
 stub_firewall_consistent() {
   local net0
-  net0="$(pct config "$CTID" 2>/dev/null | awk '/^net0:/ {print $2}')"
+  net0="$(ct_conf "$CTID" | awk '/^net0:/ {print $2}')"
   if firewall_active; then
     [[ ",${net0}," == *",firewall=1,"* ]]
   else
@@ -1384,7 +1443,7 @@ golden_current() {   # echoes the current golden CTID, if recorded
 
 golden_clones_of() {   # $1 = golden CTID; echoes CTs whose rootfs is a linked clone of it
   local vmid
-  for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+  for vmid in $(ct_list); do
     [ "$vmid" = "$1" ] && continue
     [ "$(ct_golden_base "$vmid")" = "$1" ] && echo "$vmid"
   done
@@ -1429,7 +1488,7 @@ golden_pick_slot() {   # echoes the slot to bake into; never the current golden
   local cur s users
   cur="$(golden_current)"
   for s in "${GOLDEN_SLOTS[@]}"; do
-    [ "$s" != "$cur" ] && ! pct status "$s" >/dev/null 2>&1 && { echo "$s"; return 0; }
+    [ "$s" != "$cur" ] && ! ct_conf "$s" >/dev/null && { echo "$s"; return 0; }
   done
   for s in "${GOLDEN_SLOTS[@]}"; do
     [ "$s" = "$cur" ] && continue
@@ -1485,6 +1544,7 @@ cmd_bake() {
   prev="$(golden_current)"
   destroy_sandbox   # the old template in this slot, if any (guarded; never the current one)
   shared_setup
+  ensure_template
   echo "baking golden template in CT $CTID for: ${BAKE_AGENT_LIST[*]} (from $TEMPLATE) ..."
   trap report_bake_failure EXIT
   configure_firewall
@@ -1544,12 +1604,12 @@ cmd_bake() {
 print_golden_summary() {   # one line per golden slot that exists, for `status`
   local cur vmid host role users
   cur="$(golden_current)"
-  for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
-    host="$(pct config "$vmid" 2>/dev/null | awk '/^hostname:/ {print $2}')"
+  for vmid in $(ct_list); do
+    host="$(ct_conf "$vmid" | awk '/^hostname:/ {print $2}')"
     [ "$host" = "ai-sandbox-golden" ] || continue
     role="previous"; [ "$vmid" = "$cur" ] && role="current"
     users="$(golden_clones_of "$vmid" | paste -sd' ' -)"
-    if pct config "$vmid" 2>/dev/null | grep -q '^template: 1'; then
+    if ct_conf "$vmid" | grep -q '^template: 1'; then
       printf 'golden: CT %s template (%s)%s%s\n' "$vmid" "$role" \
         "$([ "$role" = current ] && [ -f "${STATE_DIR}/golden/stamp" ] && echo ", $(head -n1 "${STATE_DIR}/golden/stamp")")" \
         "${users:+, linked clones: $users}"
@@ -1570,7 +1630,7 @@ cmd_up() {
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
   shared_setup
 
-  echo "building $AGENT sandbox (CT $CTID, $PROFILE_LABEL) from $TEMPLATE ..."
+  echo "building $AGENT sandbox (CT $CTID, $PROFILE_LABEL) ..."
   trap_provision_failure up
   create_sandbox start
 
@@ -1625,7 +1685,7 @@ cmd_export() {
   local ip mac hostip
   ip="$(sandbox_ip)"
   [ -n "$ip" ] || die "no IP for the sandbox (check ${BRIDGE}/DHCP)"
-  mac="$(pct config "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i=="hwaddr") print $(i+1)}')"
+  mac="$(ct_conf "$CTID" | awk -F'[,=]' '/^net0:/ {for (i=1;i<=NF;i++) if ($i=="hwaddr") print $(i+1)}')"
   hostip="${HOST_IP:-$(hostname -I | awk '{print $1}')}"
 
   mkdir -p "$EXPORT_DIR"
@@ -1755,7 +1815,7 @@ EOF
 # come from the config files. Not ours -> empty, and the hook does nothing.
 hook_agent_for() {   # $1 = vmid; echoes agent or nothing
   local host agent
-  host="$(pct config "$1" 2>/dev/null | awk '/^hostname:/ {print $2}')" || return 0
+  host="$(ct_conf "$1" | awk '/^hostname:/ {print $2}')" || return 0
   agent="${host#ai-sandbox-}"
   [ "$agent" != "$host" ] && profile_exists "$agent" && echo "$agent"
   return 0
@@ -1888,13 +1948,13 @@ cmd_status() {
 cmd_status_all() {
   local vmid host state ip ready found=0
   printf '%-10s %-6s %-8s %-15s %s\n' AGENT CTID STATE IP PROVISIONED
-  for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
-    host="$(pct config "$vmid" 2>/dev/null | awk '/^hostname:/ {print $2}')"
+  for vmid in $(ct_list); do
+    host="$(ct_conf "$vmid" | awk '/^hostname:/ {print $2}')"
     case "$host" in ai-sandbox-golden) continue ;; ai-sandbox-?*) ;; *) continue ;; esac
     found=1
-    state="$(pct status "$vmid" 2>/dev/null | awk '{print $2}')"
+    state="stopped"; ct_id_running "$vmid" && state="running"
     ip=""
-    [ "$state" = "running" ] && ip="$(pct exec "$vmid" -- sh -c 'hostname -I 2>/dev/null | cut -d" " -f1' 2>/dev/null || true)"
+    [ "$state" = "running" ] && ip="$(ct_attach "$vmid" sh -c 'hostname -I 2>/dev/null | cut -d" " -f1' 2>/dev/null || true)"
     ready="-"
     if [ "$state" = "running" ]; then
       ready="NO"

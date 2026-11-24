@@ -3,7 +3,7 @@
 set -euo pipefail
 T="${MOCK_T:?}"
 mkdir -p "$T/conf" "$T/ct" "$T/run"
-echo "pct $*" >> "$T/calls.log"
+[ -n "${MOCK_NOLOG:-}" ] || echo "pct $*" >> "$T/calls.log"   # lxc-attach logs itself
 cmd="$1"; shift
 # Proxmox holds /run/lock/lxc/pve-config-<id>.lock for a whole Start task,
 # hookscript pre-start included. Tests simulate that by touching

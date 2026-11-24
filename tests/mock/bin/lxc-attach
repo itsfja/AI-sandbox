@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Mock lxc-attach: `lxc-attach -n <id> [--clear-env] -- cmd...`, run through
+# the pct mock's exec emulation (it keeps the CT's mock filesystem).
+T="${MOCK_T:?}"
+echo "lxc-attach $*" >> "$T/calls.log"
+id=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) id="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+MOCK_NOLOG=1 exec "$(dirname "$0")/pct" exec "$id" -- "$@"

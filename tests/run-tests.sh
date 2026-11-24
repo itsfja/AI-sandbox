@@ -23,14 +23,14 @@ fresh() {   # new isolated world; sets T and S (script copy)
   rm -f /run/lock/ai-sandbox.*
 }
 run() {   # run the script copy in the mock world
-  env PATH="$HERE/bin:$PATH" HOME="$T/home" STATE_DIR="$T/state" FW_DIR="$T/fw" \
+  env PATH="$HERE/bin:$PATH" HOME="$T/home" STATE_DIR="$T/state" FW_DIR="$T/fw" PVE_LXC_DIR="$T/conf" \
       HOOK_SNIPPET_DIR="$T/snip" AUTO_UPDATE=off TEMPLATE=local:vztmpl/debian-12.tar.zst \
       EXPORT_DIR="$T/export" "$@"
 }
 calls_lack() { ! grep -qE "$1" "$T/calls.log"; }
 origin_of() { cat "$T/lvorigin/vm-$1-disk-0" 2>/dev/null; }   # lvmthin: a linked clone's LVM origin
 hookvars() {   # what reaches an env-less hook or systemd unit: the config, not your shell
-  echo "STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst"
+  echo "STATE_DIR=$T/state FW_DIR=$T/fw PVE_LXC_DIR=$T/conf HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst"
 }
 run_deferred() {   # $1 = unit; run the job post-stop handed to systemd-run, env-less like a unit
   env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" \
@@ -159,7 +159,7 @@ check "status reports a fresh stub" grep -q 'stopped: fresh stub, ready for GUI 
 # GUI Start: PVE holds the CT config lock for the whole task and runs
 # pre-start env-less; then boots; then runs post-start (lock released).
 gui_hook() {   # $1 = vmid, $2 = phase; env-less like PVE
-  env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst $S hook $1 $2" 2>&1
+  env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "STATE_DIR=$T/state FW_DIR=$T/fw PVE_LXC_DIR=$T/conf HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst $S hook $1 $2" 2>&1
 }
 mkdir -p "$T/locked"; touch "$T/locked/1051"; : > "$T/calls.log"
 out="$(gui_hook 1051 pre-start)"; rc=$?
@@ -175,7 +175,7 @@ check_sh "GUI post-start under the PVE lock provisions + reports" '[ $rc -eq 0 ]
 [ $rc -eq 0 ] || echo "$out" | tail -5
 check_sh "  ...provision script, credentials-free policy file in place" '[ -f "$T/ct/1051/root/provision-base.sh" ] && [ -f "$T/ct/1051/root/.vibe/config.toml" ]'
 check "  ...without pct push (it needs the lock)" bash -c "! grep -q '^pct push ' '$T/calls.log'"
-check "  ...provisioning runs in a clean env with HOME=/root (PVE hooks have none)" grep -qE '^pct exec 1051 -- env -i HOME=/root .*PATH=/root/.local/bin:[^ ]* bash /root/provision-base.sh$' "$T/calls.log"
+check "  ...provisioning runs in a clean env with HOME=/root (PVE hooks have none)" grep -qE '^lxc-attach -n 1051 --clear-env -- env -i HOME=/root .*PATH=/root/.local/bin:[^ ]* bash /root/provision-base.sh$' "$T/calls.log"
 check "  ...hook output is ASCII-only (PVE task log mangles UTF-8)" bash -c "! LC_ALL=C grep -q '[^ -~]' <<<\"\$1\"" _ "$out"
 rm -f "$T/locked/1051"
 # a used (booted) CT must not be started again from the GUI
@@ -190,7 +190,7 @@ check "status flags the used stopped CT" grep -q 'NOT a fresh stub' <<<"$out"
 # firewall settings changed between park and Start -> refuse, don't boot
 run FORCE=1 RESCUE=0 "$S" down mistral >/dev/null 2>&1
 touch "$T/locked/1051"
-out="$(gui_hook_fw_off() { env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "FIREWALL=off STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off $S hook 1051 pre-start" 2>&1; }; gui_hook_fw_off)"; rc=$?
+out="$(gui_hook_fw_off() { env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "FIREWALL=off STATE_DIR=$T/state FW_DIR=$T/fw PVE_LXC_DIR=$T/conf HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off $S hook 1051 pre-start" 2>&1; }; gui_hook_fw_off)"; rc=$?
 check_sh "GUI pre-start refuses when firewall settings changed since park" '[ $rc -ne 0 ] && grep -q "firewall settings changed" <<<"$out"'
 check "  ...and keeps the stub pristine for a later Start" [ -e "$T/state/mistral/pristine-stub" ]
 rm -f "$T/locked/1051"
@@ -387,7 +387,7 @@ check_sh "  ...without a hookscript or pinned MAC" '! grep -qE "^hookscript:|hwa
 check "  ...installs the baseline + every agent CLI, then verifies" grep -q 'curl -LsSf https://mistral.ai/vibe/install.sh | bash' "$T/ct/1048/root/provision-base.sh"
 check "  ...provision script is valid bash" bash -n "$T/ct/1048/root/provision-base.sh"
 check "  ...strips SSH host keys, machine-id, authorized_keys" grep -qF 'rm -f /etc/ssh/ssh_host_*' "$T/calls.log"
-check "  ...checks every credential path" grep -q 'pct exec 1048 -- env -i .* test -e /root/.vibe/.env$' "$T/calls.log"
+check "  ...checks every credential path" grep -q 'lxc-attach -n 1048 --clear-env -- env -i .* test -e /root/.vibe/.env$' "$T/calls.log"
 check_sh "  ...never injects a credential or policy" '! grep -q "/root/.vibe/.env\|config.toml" <(find "$T/ct/1048" -type f)'
 check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
 check "  ...records it as current on the host" [ "$(cat "$T/state/golden/current")" = 1048 ]
@@ -430,7 +430,7 @@ check_sh "a foreign CT in a golden slot is never destroyed" '[ $rc -ne 0 ] && gr
 
 echo "== spawn: sessions as linked clones of the golden (#9b)"
 fresh
-printf 'lvmthin: local-lvm\n\tthinpool data\n\tcontent rootdir,images\n' > "$T/storage.cfg"
+printf 'lvmthin: local-lvm\n\tthinpool data\n\tvgname pve\n\tcontent rootdir,images\n' > "$T/storage.cfg"
 B() { run STORAGE_CFG="$T/storage.cfg" "$@"; }
 out="$(B "$S" up mistral 2>&1)"; rc=$?
 check_sh "no golden yet, MODE=auto: full rebuild with a note" '[ $rc -eq 0 ] && grep -q "MODE=auto: no golden template yet .* full rebuild instead" <<<"$out" && grep -q "^pct create 1051 " "$T/calls.log"'
@@ -457,10 +457,12 @@ check_sh "  ...with this instance's settings: tag, hookscript, pinned MAC + fire
 check_sh "  ...and none of the golden's identity" '! grep -qE "^template:|golden" "$C1" && grep -q "^hostname: ai-sandbox-mistral$" "$C1"'
 check "  ...started after the settings were applied" bash -c "[ \$(grep -n '^pct set 1051 ' '$T/calls.log' | head -n1 | cut -d: -f1) -lt \$(grep -n '^pct start 1051' '$T/calls.log' | cut -d: -f1) ]"
 check "  ...skips the baseline/CLI provisioning (baked in)" calls_lack 'bash /root/provision-base.sh'
-check "  ...regenerates SSH host keys" grep -q "pct exec 1051 -- env -i .* bash -c ssh-keygen -A" "$T/calls.log"
+check "  ...regenerates SSH host keys" grep -q "lxc-attach -n 1051 --clear-env -- env -i .* bash -c ssh-keygen -A" "$T/calls.log"
 check_sh "  ...pushes root's authorized key" 'cmp -s "$T/state/ssh/ai-sandbox.pub" "$T/ct/1051/root/.ssh/authorized_keys"'
 check_sh "  ...injects the policy and marks it provisioned" '[ -f "$T/ct/1051/root/.vibe/config.toml" ] && [ "$(cat "$T/state/mistral/provisioned")" = 1051 ]'
 check "  ...prints the ssh line" grep -q 'sandbox ready.' <<<"$out"
+check "  ...with no read-only pct/pveam/pvesm calls (each ~2.5 s of Perl on pve1)" calls_lack '^(pct (config|status|list|exec|push)|pveam|pvesm) '
+check_sh "  ...only the writes go through pct" '[ "$(grep -cE "^pct " "$T/calls.log")" -le 6 ]'
 check "  ...its rootfs is a plain lvmthin volume (as on pve1)" grep -q '^rootfs: local-lvm:vm-1051-disk-0,' "$C1"
 check_sh "  ...and the host-side firewall ruleset survives pct clone" 'grep -q "^# ai-sandbox managed firewall (CT 1051" "$T/fw/1051.fw" && grep -q "OUT DROP -dest 192.168.0.0/16" "$T/fw/1051.fw"'
 check_sh "  ...rewritten after the clone, before the start" '[ $(grep -n "^pct clone 1048 1051" "$T/calls.log" | cut -d: -f1) -lt $(grep -n "^pct start 1051" "$T/calls.log" | cut -d: -f1) ]'
