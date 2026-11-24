@@ -363,6 +363,69 @@ check "  ...no marker" [ ! -e "$T/state/mistral/provisioned" ]
 out="$(run FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"; rc=$?
 check_sh "a good up afterwards: provisioned again, no FAILED line" '[ $rc -eq 0 ] && [ "$(cat "$T/state/mistral/provisioned")" = 1051 ] && ! grep -q "provisioning FAILED" <<<"$out"'
 
+echo "== bake: golden template in two alternating slots (#9a)"
+fresh
+printf 'dir: local\n\tpath /var/lib/vz\n\tcontent vztmpl,backup\n\nlvmthin: local-lvm\n\tthinpool data\n\tcontent rootdir,images\n' > "$T/storage.cfg"
+B() { run STORAGE_CFG="$T/storage.cfg" "$@"; }
+out="$(B STORAGE=local "$S" bake 2>&1)"; rc=$?
+check_sh "bake refuses storage that cannot hold linked clones" '[ $rc -ne 0 ] && grep -q "storage .local. (type .dir.*cannot hold linked clones" <<<"$out"'
+out="$(B GOLDEN_CTIDS=1051,1049 "$S" bake 2>&1)"; rc=$?
+check_sh "bake refuses a golden slot that is an agent's CTID" '[ $rc -ne 0 ] && grep -q "golden CT ID 1051 collides" <<<"$out"'
+out="$(B BAKE_AGENTS=bogus "$S" bake 2>&1)"; rc=$?
+check_sh "bake refuses an unknown agent in BAKE_AGENTS" '[ $rc -ne 0 ] && grep -q "unknown agent .bogus. in BAKE_AGENTS" <<<"$out"'
+: > "$T/calls.log"
+out="$(B "$S" bake 2>&1)"; rc=$?
+check "first bake exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+G="$T/conf/1048.conf"
+check "  ...builds in slot 1048 as ai-sandbox-golden" grep -q '^hostname: ai-sandbox-golden$' "$G"
+check "  ...tagged ai-sandbox;golden" grep -q '^tags: ai-sandbox;golden$' "$G"
+check "  ...is a template now, stopped" grep -q '^template: 1$' "$G"
+check_sh "  ...without a hookscript or pinned MAC" '! grep -qE "^hookscript:|hwaddr=" "$G"'
+check "  ...installs the baseline + every agent CLI, then verifies" grep -q 'curl -LsSf https://mistral.ai/vibe/install.sh | bash' "$T/ct/1048/root/provision-base.sh"
+check "  ...provision script is valid bash" bash -n "$T/ct/1048/root/provision-base.sh"
+check "  ...strips SSH host keys, machine-id, authorized_keys" grep -qF 'rm -f /etc/ssh/ssh_host_*' "$T/calls.log"
+check "  ...checks every credential path" grep -q 'pct exec 1048 -- env -i .* test -e /root/.vibe/.env$' "$T/calls.log"
+check_sh "  ...never injects a credential or policy" '! grep -q "/root/.vibe/.env\|config.toml" <(find "$T/ct/1048" -type f)'
+check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
+check "  ...records it as current on the host" [ "$(cat "$T/state/golden/current")" = 1048 ]
+check "  ...build-time firewall removed (the template never runs)" [ ! -e "$T/fw/1048.fw" ]
+check_sh "  ...stop happens before template" '[ $(grep -n "^pct stop 1048" "$T/calls.log" | cut -d: -f1) -lt $(grep -n "^pct template 1048" "$T/calls.log" | cut -d: -f1) ]'
+out="$(run "$S" status 2>&1)"
+check_sh "status lists the golden as a template, not as an agent" 'grep -q "^golden: CT 1048 template (current), baked=" <<<"$out" && ! grep -qE "^golden +1048" <<<"$out"'
+out="$(run "$S" hook 1048 pre-start 2>&1)"; rc=$?
+check_sh "hook ignores the golden CT" '[ $rc -eq 0 ] && [ -z "$out" ]'
+out="$(run "$S" up golden 2>&1)"; rc=$?
+check_sh "'golden' is not an agent" '[ $rc -ne 0 ] && grep -q "unknown agent .golden." <<<"$out"'
+out="$(B "$S" bake 2>&1)"; rc=$?
+check_sh "second bake goes to slot 1049 and leaves 1048 alone" '[ $rc -eq 0 ] && [ "$(cat "$T/state/golden/current")" = 1049 ] && grep -q "^template: 1$" "$T/conf/1048.conf" && grep -q "^template: 1$" "$T/conf/1049.conf"'
+check "  ...says the previous golden is kept" grep -q 'previous golden CT 1048 is kept' <<<"$out"
+# a sandbox still runs from 1048: the third bake must not destroy it
+printf 'hostname: ai-sandbox-mistral\ntags: ai-sandbox\nrootfs: local-lvm:base-1048-disk-0/vm-1051-disk-0,size=40G\n' > "$T/conf/1051.conf"
+: > "$T/calls.log"
+out="$(B "$S" bake 2>&1)"; rc=$?
+check_sh "third bake refuses while slot 1048 backs a linked clone" '[ $rc -ne 0 ] && grep -q "CT 1048 still backs linked clone(s): 1051" <<<"$out"'
+check_sh "  ...destroying nothing, current still 1049" 'calls_lack "^pct (destroy|create) " && [ "$(cat "$T/state/golden/current")" = 1049 ]'
+out="$(run "$S" status 2>&1)"
+check "status shows the previous golden's clones" grep -q '^golden: CT 1048 template (previous), linked clones: 1051' <<<"$out"
+rm -f "$T/conf/1051.conf"
+: > "$T/calls.log"
+out="$(B "$S" bake 2>&1)"; rc=$?
+check_sh "once 1048 is free, the third bake rebuilds it" '[ $rc -eq 0 ] && grep -q "^pct destroy 1048" "$T/calls.log" && [ "$(cat "$T/state/golden/current")" = 1048 ]'
+check "  ...and never touches the current one (1049)" calls_lack '^pct (destroy|stop|create) 1049'
+# a credential in the image: fail closed, keep the current golden
+out="$(B MOCK_LEAK_PATH=/root/.vibe/.env "$S" bake 2>&1)"; rc=$?
+check_sh "a credential path in the image fails the bake" '[ $rc -ne 0 ] && grep -q "credential path(s) present in the golden image" <<<"$out" && grep -q "mistral: /root/.vibe/.env" <<<"$out"'
+check_sh "  ...the build CT is not templated, current unchanged" '! grep -q "^template: 1$" "$T/conf/1049.conf" && [ "$(cat "$T/state/golden/current")" = 1048 ]'
+check "  ...and the failure line says so" grep -q 'bake: FAILED (exit 1) - CT 1049 was not templated; the current golden (CT 1048) is unchanged' <<<"$out"
+out="$(run "$S" status 2>&1)"
+check "status flags the half-built slot" grep -q '^golden: CT 1049 NOT a template' <<<"$out"
+out="$(B "$S" bake 2>&1)"; rc=$?
+check_sh "the next bake replaces the half-built CT" '[ $rc -eq 0 ] && grep -q "^template: 1$" "$T/conf/1049.conf" && [ "$(cat "$T/state/golden/current")" = 1049 ]'
+printf 'hostname: wordpress\ntags: web\n' > "$T/conf/1048.conf"
+out="$(B "$S" bake 2>&1)"; rc=$?
+check_sh "a foreign CT in a golden slot is never destroyed" '[ $rc -ne 0 ] && grep -q "refusing to touch CT 1048" <<<"$out" && grep -q wordpress "$T/conf/1048.conf"'
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]
