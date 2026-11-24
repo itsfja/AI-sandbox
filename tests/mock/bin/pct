@@ -9,7 +9,7 @@ cmd="$1"; shift
 # hookscript pre-start included. Tests simulate that by touching
 # $T/locked/<id>: commands that need the lock then time out like PVE does.
 case "$cmd" in
-  create|destroy|set|start|stop)
+  create|destroy|set|start|stop|push)
     if [ -e "$T/locked/${1:-}" ]; then
       echo "trying to acquire lock..." >&2
       echo "can't lock file '/run/lock/lxc/pve-config-$1.lock' - got timeout" >&2
@@ -64,7 +64,13 @@ case "$cmd" in
       mkdir) shift; for a in "$@"; do [ "$a" = -p ] || mkdir -p "$T/ct/$id$a"; done ;;
       chown) : ;;
       chmod) chmod "$2" "$T/ct/$id$3" ;;
-      sh) echo "${MOCK_IP:-192.168.3.77}" ;;
+      sh)
+        case "$3" in
+          *'cat > "$1"'*)   # ct_push_file: sh -c SCRIPT sh DEST MODE < src
+            dest="$T/ct/$id$5"; mkdir -p "$(dirname "$dest")"
+            cat > "$dest"; chmod "$6" "$dest" ;;
+          *) echo "${MOCK_IP:-192.168.3.77}" ;;
+        esac ;;
       bash) [ "$2" = "-c" ] && exit 0; echo "(mock: would run $2 in CT $id)" ;;
       *) echo "(mock exec: $*)" ;;
     esac ;;

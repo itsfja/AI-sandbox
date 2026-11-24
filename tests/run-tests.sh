@@ -143,9 +143,15 @@ check "GUI pre-start under the PVE lock succeeds on a fresh stub" [ $rc -eq 0 ]
 check "  ...without touching the CT (no destroy/create/set)" bash -c "! grep -qE '^pct (destroy|create|set) ' '$T/calls.log'"
 check "  ...says it is starting the stub" grep -q 'fresh, never-booted stub' <<<"$out"
 check "  ...and consumes the marker" [ ! -e "$T/state/mistral/pristine-stub" ]
-rm -f "$T/locked/1051"; touch "$T/run/1051"
-out="$(run "$S" hook 1051 post-start 2>&1)"
-check "GUI post-start provisions + reports" grep -q 'mistral sandbox ready via GUI' <<<"$out" && [ -f "$T/ct/1051/root/.vibe/config.toml" ]
+# PVE boots it and runs post-start STILL holding the CT config lock
+touch "$T/run/1051"; : > "$T/calls.log"
+out="$(gui_hook 1051 post-start)"; rc=$?
+check "GUI post-start under the PVE lock provisions + reports" [ $rc -eq 0 ] && grep -q 'mistral sandbox ready via GUI' <<<"$out"
+[ $rc -eq 0 ] || echo "$out" | tail -5
+check "  ...provision script, credentials-free policy file in place" [ -f "$T/ct/1051/root/provision-base.sh" ] && [ -f "$T/ct/1051/root/.vibe/config.toml" ]
+check "  ...without pct push (it needs the lock)" bash -c "! grep -q '^pct push ' '$T/calls.log'"
+check "  ...hook output is ASCII-only (PVE task log mangles UTF-8)" bash -c "! LC_ALL=C grep -q '[^ -~]' <<<\"\$1\"" _ "$out"
+rm -f "$T/locked/1051"
 # a used (booted) CT must not be started again from the GUI
 rm -f "$T/run/1051"; touch "$T/locked/1051"; : > "$T/calls.log"
 out="$(gui_hook 1051 pre-start)"; rc=$?
@@ -180,7 +186,7 @@ run "$S" up mistral >/dev/null 2>&1
 ( exec 9>/run/lock/ai-sandbox.mistral.lock; flock -n 9; sleep 5 ) &
 holder=$!; sleep 0.5
 out="$(run "$S" hook 1051 post-stop 2>&1)"
-check "mistral hook passes through while mistral's lock is held" grep -q 'mistral operation in progress — post-stop hook passthrough' <<<"$out"
+check "mistral hook passes through while mistral's lock is held" grep -q 'mistral operation in progress - post-stop hook passthrough' <<<"$out"
 out="$(run "$S" up fake 2>&1)"; rc=$?
 check "fake agent builds while mistral is locked" [ $rc -eq 0 ]
 [ $rc -eq 0 ] || echo "$out" | tail -5
