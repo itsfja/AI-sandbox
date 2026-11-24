@@ -69,7 +69,7 @@ fresh
 out="$(run "$S" agents)"; check "agents lists mistral with CT 1051" grep -q 'mistral *CT 1051 *Mistral Vibe CLI' <<<"$out"
 out="$(run "$S" up 2>&1)"; rc=$?
 check "up without agent fails" [ $rc -ne 0 ]
-check "  ...and names known agents" grep -q 'known agents: claude mistral' <<<"$out"
+check "  ...and names known agents" grep -q 'known agents: claude gemini mistral' <<<"$out"
 out="$(run "$S" up bogus 2>&1)"; check "unknown agent rejected" grep -q "unknown agent 'bogus'" <<<"$out"
 out="$(run "$S" up 'Mistral;rm' 2>&1)"; check "invalid agent name rejected" grep -q "unknown agent" <<<"$out"
 out="$(run AGENT=mistral "$S" status 2>&1)"; check "AGENT env works for status" grep -q '^mistral: no sandbox (CT 1051 absent)' <<<"$out"
@@ -390,7 +390,7 @@ check "  ...strips SSH host keys, machine-id, authorized_keys" grep -qF 'rm -f /
 check "  ...and makes clones generate their own host keys at boot" grep -qF 'ExecStartPre=/usr/bin/ssh-keygen -A' "$T/calls.log"
 check "  ...checks every credential path" grep -q 'lxc-attach -n 1048 --clear-env -- env -i .* test -e /root/.vibe/.env$' "$T/calls.log"
 check_sh "  ...never injects a credential or policy" '! grep -q "/root/.vibe/.env\|config.toml" <(find "$T/ct/1048" -type f)'
-check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=claude,mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
+check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=claude,gemini,mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
 check "  ...with every agent's CLI (BAKE_AGENTS=all)" grep -q 'curl -fsSL https://claude.ai/install.sh | bash' "$T/ct/1048/root/provision-base.sh"
 check "  ...records it as current on the host" [ "$(cat "$T/state/golden/current")" = 1048 ]
 check "  ...build-time firewall removed (the template never runs)" [ ! -e "$T/fw/1048.fw" ]
@@ -590,6 +590,43 @@ out="$(run "$S" export claude 2>&1)"
 check "export suggests the Claude Code VS Code extension" grep -q 'anthropic.claude-code' <<<"$out"
 out="$(run "$S" status 2>&1)"
 check "status (all) lists claude" grep -qE '^claude +1052 +running' <<<"$out"
+
+echo "== gemini profile (#11)"
+fresh
+out="$(run "$S" agents)"
+check "agents lists gemini with CT 1053" grep -q 'gemini *CT 1053 *Gemini CLI' <<<"$out"
+out="$(run "$S" up gemini 2>&1)"; rc=$?
+check "up gemini without secrets exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+check "  ...with the AI Studio hint" grep -q 'aistudio.google.com' <<<"$out"
+P="$T/ct/1053/root/provision-base.sh"
+check_sh "  ...Node >= 20 from NodeSource only when missing or too old, then the npm package" 'grep -q "process.versions.node.split" "$P" && grep -q "deb.nodesource.com/setup_22.x" "$P" && grep -q "npm install -g --no-fund --no-audit @google/gemini-cli" "$P" && [ "$(tail -n1 "$P")" = "gemini --version" ]'
+check "  ...provision script is valid bash" bash -n "$P"
+check_sh "  ...and installs the key launcher (folder trust blocks ~/.gemini/.env)" 'grep -q "GEMINI_API_KEY from ~/.gemini/.env, also in untrusted folders" "$P" && grep -q "> /usr/local/bin/gemini" "$P"'
+G="$T/ct/1053/etc/gemini-cli/settings.json"
+check "system settings injected, mode 444" [ "$(stat -c %a "$G" 2>/dev/null)" = 444 ]
+check_sh "  ...valid JSON, every default-deny key" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); s=d[\"security\"]; a=d[\"admin\"]; assert s[\"disableYoloMode\"] is True and s[\"disableAlwaysAllow\"] is True and s[\"blockGitExtensions\"] is True and a[\"secureModeEnabled\"] is True and a[\"mcp\"][\"enabled\"] is False and a[\"extensions\"][\"enabled\"] is False and d[\"mcp\"][\"allowed\"]==[]" "$G"'
+out="$(run AGENT_MCP=on FORCE=1 RESCUE=0 "$S" up gemini 2>&1)"
+check_sh "AGENT_MCP=on drops only the MCP keys" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert \"mcp\" not in d and \"mcp\" not in d[\"admin\"] and d[\"admin\"][\"extensions\"][\"enabled\"] is False and d[\"security\"][\"disableYoloMode\"] is True" "$G"'
+out="$(run AGENT_AUTO_APPROVE=on AGENT_CONNECTORS=on FORCE=1 RESCUE=0 "$S" up gemini 2>&1)"
+check_sh "only MCP off: no security block, admin holds just mcp" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert \"security\" not in d and d[\"admin\"]=={\"mcp\":{\"enabled\":False}} and d[\"mcp\"]=={\"allowed\":[]}" "$G"'
+out="$(run AGENT_MCP=on AGENT_CONNECTORS=on AGENT_AUTO_APPROVE=on FORCE=1 RESCUE=0 "$S" up gemini 2>&1)"
+check_sh "all three on: an empty (valid) policy" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))=={}" "$G"'
+mkdir -p "$T/state/gemini"; printf "GEMINI_API_KEY='AIzaSy-test_not.real'\n" > "$T/state/gemini/secrets.env"; chmod 600 "$T/state/gemini/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up gemini 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # used inside check_sh strings
+E="$T/ct/1053/root/.gemini/.env"
+check_sh "key -> ~/.gemini/.env (600), quotes stripped" '[ $rc -eq 0 ] && [ "$(cat "$E")" = "GEMINI_API_KEY=AIzaSy-test_not.real" ] && [ "$(stat -c %a "$E")" = 600 ]'
+check_sh "  ...and user settings select API-key auth (valid JSON)" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"security\"][\"auth\"][\"selectedType\"]==\"gemini-api-key\"" "$T/ct/1053/root/.gemini/settings.json"'
+printf 'GEMINI_API_KEY=abc$(touch %s/pwned)\n' "$T" > "$T/state/gemini/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up gemini 2>&1)"; rc=$?
+check_sh "a key with shell metacharacters is refused, never executed" '[ $rc -ne 0 ] && grep -q "has characters a key never contains" <<<"$out" && [ ! -e "$T/pwned" ]'
+printf 'OTHER=1\n' > "$T/state/gemini/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up gemini 2>&1)"; rc=$?
+check_sh "a secrets file without GEMINI_API_KEY fails clearly" '[ $rc -ne 0 ] && grep -q "no GEMINI_API_KEY line" <<<"$out"'
+rm -f "$T/state/gemini/secrets.env"; run FORCE=1 RESCUE=0 "$S" up gemini >/dev/null 2>&1
+out="$(run "$S" export gemini 2>&1)"
+check "export suggests the Gemini VS Code companion" grep -q 'google.gemini-cli-vscode-ide-companion' <<<"$out"
 
 echo
 echo "passed: $pass  failed: $fail"

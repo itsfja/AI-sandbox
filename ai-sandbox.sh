@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 # ai-sandbox.sh — single-use, rebuild-on-demand LXC sandboxes for AI coding
-#                 agents on Proxmox VE (Mistral Vibe and Claude Code today;
-#                 Gemini CLI and drop-in profiles to follow)
+#                 agents on Proxmox VE (Mistral Vibe, Claude Code and Gemini
+#                 CLI today; drop-in profiles to follow)
 #
 # Usage:  ai-sandbox.sh <command> [agent]        (or AGENT=<agent> in env)
 #
@@ -318,6 +318,104 @@ profile_claude_policy() {
   ct_push_file "$tmp" /etc/claude-code/managed-settings.json 444 || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
   echo "hardening: injected /etc/claude-code/managed-settings.json"
+}
+
+# ---- gemini: Gemini CLI --------------------------------------------------------
+profile_gemini_meta() {
+  PROFILE_CTID=1053
+  PROFILE_LABEL="Gemini CLI"
+  PROFILE_VSCODE_EXT="google.gemini-cli-vscode-ide-companion"
+}
+
+# Gemini CLI is an npm package needing Node.js >= 20; Debian 12 ships 18,
+# so Node 22 LTS comes from NodeSource (same trust model as the other
+# agents' curl | bash installers). It lands in the golden for every agent.
+profile_gemini_install() {
+  cat <<'EOF'
+if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get install -y -qq --no-install-recommends -o Dpkg::Use-Pty=0 nodejs
+fi
+npm install -g --no-fund --no-audit @google/gemini-cli
+# Gemini CLI loads no .env file in a folder it does not trust, not even
+# ~/.gemini/.env (seen on pve1: "must specify GEMINI_API_KEY"). Folder
+# trust stays on; this launcher, first on PATH, reads the sandbox's own key
+# file, never a project's, then runs the real CLI.
+real="$(command -v gemini)"
+if [ "$real" != /usr/local/bin/gemini ]; then
+  printf '%s\n' '#!/bin/sh' \
+    '# ai-sandbox: GEMINI_API_KEY from ~/.gemini/.env, also in untrusted folders' \
+    'if [ -z "${GEMINI_API_KEY:-}" ] && [ -r "${HOME:-/root}/.gemini/.env" ]; then' \
+    '  GEMINI_API_KEY="$(sed -n "s/^GEMINI_API_KEY=//p" "${HOME:-/root}/.gemini/.env" | tail -n 1)"' \
+    '  export GEMINI_API_KEY' \
+    'fi' \
+    "exec $real \"\$@\"" > /usr/local/bin/gemini
+  chmod 755 /usr/local/bin/gemini
+fi
+EOF
+}
+
+profile_gemini_verify() { echo "gemini --version"; }
+
+# secrets.env holds GEMINI_API_KEY=<key> (Google AI Studio). It is parsed,
+# never executed, and written to ~/.gemini/.env, which the CLI loads unless
+# a project has its own .env (the first .env found wins). The user settings
+# select API-key auth so the first run does not ask how to sign in.
+profile_gemini_credentials() {
+  local key tmp
+  key="$(secrets_get GEMINI_API_KEY "$SECRETS_FILE")"
+  [ -n "$key" ] || die "no GEMINI_API_KEY line in $SECRETS_FILE"
+  [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] || die "GEMINI_API_KEY in $SECRETS_FILE has characters a key never contains"
+  tmp="$(mktemp)"
+  printf 'GEMINI_API_KEY=%s\n' "$key" > "$tmp"
+  ct_push_file "$tmp" /root/.gemini/.env 600 || { rm -f "$tmp"; return 1; }
+  printf '{\n  "security": { "auth": { "selectedType": "gemini-api-key" } }\n}\n' > "$tmp"
+  ct_push_file "$tmp" /root/.gemini/settings.json 600 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  echo "credentials injected (host: $SECRETS_FILE -> CT: /root/.gemini/.env)"
+}
+
+profile_gemini_credential_paths() { echo /root/.gemini/.env; }
+
+profile_gemini_credentials_hint() {
+  echo "  create a key at aistudio.google.com (Get API key), then run:"
+  echo "    printf 'GEMINI_API_KEY=<key>\\n' > $SECRETS_FILE && chmod 600 $SECRETS_FILE"
+}
+
+# The system settings file overrides user and project settings.
+#   AGENT_AUTO_APPROVE  YOLO mode and "Always allow" (security.* and the
+#                       admin secure mode)
+#   AGENT_MCP           MCP servers (empty allowlist + admin switch)
+#   AGENT_CONNECTORS    extensions, Gemini's add-on mechanism (they can
+#                       bundle MCP servers and tools)
+profile_gemini_policy() {
+  local tmp sec=() adm=() top=() all=() i
+  if [ "$AGENT_AUTO_APPROVE" != on ]; then
+    sec+=('"disableYoloMode": true' '"disableAlwaysAllow": true')
+    adm+=('"secureModeEnabled": true')
+  fi
+  if [ "$AGENT_MCP" != on ]; then
+    top+=('"mcp": { "allowed": [] }')
+    adm+=('"mcp": { "enabled": false }')
+  fi
+  if [ "$AGENT_CONNECTORS" != on ]; then
+    sec+=('"blockGitExtensions": true')
+    adm+=('"extensions": { "enabled": false }')
+  fi
+  [ "${#sec[@]}" -gt 0 ] && all+=("\"security\": { $(IFS=,; echo "${sec[*]}" | sed 's/,/, /g') }")
+  [ "${#adm[@]}" -gt 0 ] && all+=("\"admin\": { $(IFS=,; echo "${adm[*]}" | sed 's/,/, /g') }")
+  all+=("${top[@]}")
+  tmp="$(mktemp)"
+  {
+    echo "{"
+    for i in "${!all[@]}"; do
+      printf '  %s%s\n' "${all[$i]}" "$([ "$i" -lt $((${#all[@]} - 1)) ] && echo ,)"
+    done
+    echo "}"
+  } > "$tmp"
+  ct_push_file "$tmp" /etc/gemini-cli/settings.json 444 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  echo "hardening: injected /etc/gemini-cli/settings.json"
 }
 
 # One KEY=value from a secrets file, parsed like the config files (never
