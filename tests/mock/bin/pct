@@ -82,7 +82,12 @@ case "$cmd" in
             cat > "$dest"; chmod "$6" "$dest" ;;
           *) echo "${MOCK_IP:-192.168.3.77}" ;;
         esac ;;
-      bash) [ "$2" = "-c" ] && exit 0; echo "(mock: would run $2 in CT $id)" ;;
+      bash) [ "$2" = "-c" ] && exit 0
+        # MOCK_PROVISION_FAIL=1: the base provisioning dies like a broken install
+        if [ -n "${MOCK_PROVISION_FAIL:-}" ] && [ "$2" = /root/provision-base.sh ]; then
+          echo "bash: line 1: vibe: command not found" >&2; exit 127
+        fi
+        echo "(mock: would run $2 in CT $id)" ;;
       *) echo "(mock exec: $*)" ;;
     esac ;;
   *) echo "mock pct: unhandled $cmd" >&2; exit 3 ;;

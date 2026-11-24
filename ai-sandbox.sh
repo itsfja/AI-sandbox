@@ -30,6 +30,8 @@
 #   <agent>/config.env       optional settings for one instance
 #   <agent>/secrets.env      the agent's credential (mode 600, never committed)
 #   <agent>/mac              retained MAC (generated on first build)
+#   <agent>/pristine-stub    "the stopped CT has never booted" (GUI Start gate)
+#   <agent>/provisioned      "the running CT finished provisioning" (status)
 # config.env files hold plain KEY=value lines (never executed). Precedence:
 # command-line env > <agent>/config.env > config.env > built-in default.
 # Put lasting overrides there: GUI Start/Stop hooks run WITHOUT your shell
@@ -142,6 +144,7 @@ apply_defaults() {
   LOCK_FILE="/run/lock/ai-sandbox.${AGENT}.lock"
   GUARD_STAMP="/run/lock/ai-sandbox.${AGENT}.workguard-ok"
   STUB_MARKER="${INSTANCE_DIR}/pristine-stub"   # "this stopped CT has never booted"
+  PROVISIONED_MARKER="${INSTANCE_DIR}/provisioned"  # "this running CT finished provisioning"
   PARK_UNIT="ai-sandbox-park-${AGENT}-${CTID}"  # transient systemd unit that parks after a GUI Stop
   FORCE="${FORCE:-0}"                  # 1 = skip the work-loss guard prompt (still rescue-archives)
   RESCUE="${RESCUE:-1}"                # 1 = vzdump before an approved guarded teardown
@@ -639,6 +642,7 @@ destroy_sandbox() {
   guard_ct   # ownership interlock: never destroy a CT that is not ours
   work_guard destroy || die "work guard: refusing to destroy CT $CTID"
   clear_stub_marker   # whatever comes next is not the parked stub
+  clear_provisioned
   if ct_exists; then
     ct_running && pct stop "$CTID"
     pct destroy "$CTID" --purge
@@ -1017,6 +1021,37 @@ mark_stub_pristine() {
 
 clear_stub_marker() { rm -f "$STUB_MARKER"; }
 
+# Provisioned marker (#15). Proxmox ignores a failing post-start hook and
+# still ends the Start task "TASK OK", so the green tick proves nothing.
+# provision_and_report clears this mark first and writes it only as its
+# very last step; destroy and pre-start clear it too. `status` reads it:
+# a running CT without it was never (fully) provisioned.
+mark_provisioned() {
+  mkdir -p "$(dirname "$PROVISIONED_MARKER")"
+  printf '%s\n' "$CTID" > "$PROVISIONED_MARKER"
+}
+
+clear_provisioned() { rm -f "$PROVISIONED_MARKER"; }
+
+is_provisioned() {
+  [ -f "$PROVISIONED_MARKER" ] && [ "$(cat "$PROVISIONED_MARKER" 2>/dev/null)" = "$CTID" ]
+}
+
+# Make a failed build say so in plain words at the end of its output (the
+# PVE task log, or the terminal): set -e failures otherwise end on whatever
+# the failing command printed, e.g. `vibe: command not found`.
+# Cleared with `trap - EXIT` once provisioning has succeeded.
+trap_provision_failure() {   # $1 = label (up | post-start)
+  PROVISION_LABEL="$1"
+  trap report_provision_failure EXIT
+}
+
+report_provision_failure() {
+  local rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  echo "$PROVISION_LABEL: provisioning FAILED (exit $rc) - the $AGENT sandbox is NOT ready (Proxmox may still mark the task OK). Read the output above, then on the host run: $0 up $AGENT"
+}
+
 stub_is_pristine() {
   [ -f "$STUB_MARKER" ] && [ "$(cat "$STUB_MARKER" 2>/dev/null)" = "$CTID" ] \
     && ct_exists && ! ct_running
@@ -1092,6 +1127,7 @@ inject_credentials() {
 # Shared post-build provisioning: baseline + agent CLI + credentials +
 # policy + optional user hooks (script dir, then the instance dir).
 provision_and_report() {
+  clear_provisioned
   echo "provisioning base toolchain and $PROFILE_LABEL ..."
   local prov hook
   prov="$(mktemp)"
@@ -1113,6 +1149,8 @@ provision_and_report() {
     ct_push_file "$hook" /root/provision.sh 700
     ct_run bash /root/provision.sh
   done
+
+  mark_provisioned   # last step: only a complete provisioning sets it
 }
 
 print_ssh_line() {
@@ -1147,6 +1185,7 @@ cmd_up() {
   shared_setup
 
   echo "building $AGENT sandbox (CT $CTID, $PROFILE_LABEL) from $TEMPLATE ..."
+  trap_provision_failure up
   create_sandbox start
 
   local ip
@@ -1156,6 +1195,7 @@ cmd_up() {
   purge_known_hosts "$ip"
 
   provision_and_report
+  trap - EXIT
   print_hardening_summary
   warn_public_ipv6
   warn_datacenter_firewall
@@ -1379,15 +1419,18 @@ cmd_hook() {
       stub_firewall_consistent || die "pre-start: firewall settings changed since CT $CTID was parked (FIREWALL=$FIREWALL, EGRESS_POLICY=$EGRESS_POLICY). On the host, run: $0 up $AGENT"
       configure_firewall   # refresh the host-side ruleset (a file under /etc/pve/firewall, not the CT config)
       clear_stub_marker    # booting now: from here on this is a used disk
+      clear_provisioned
       echo "pre-start: CT $CTID is a fresh, never-booted stub - starting it"
       ;;  # PVE now boots the stub; post-start provisions it
     post-start)
       hook_lock "$phase" || exit 0
+      trap_provision_failure post-start
       guard_ct
       local ip
-      ip="$(wait_for_ip)" || { echo "post-start: no IP (check ${BRIDGE}/DHCP)"; exit 0; }
+      ip="$(wait_for_ip)" || die "post-start: no IP (check ${BRIDGE}/DHCP)"
       purge_known_hosts "$ip"
       provision_and_report
+      trap - EXIT
       print_hardening_summary
       warn_public_ipv6
       warn_datacenter_firewall
@@ -1428,7 +1471,15 @@ cmd_status() {
   fi
   if ! ct_exists; then echo "$AGENT: no sandbox (CT $CTID absent)"; exit 0; fi
   if ct_running; then
-    echo "$AGENT: CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
+    local prov
+    if is_provisioned; then
+      prov="provisioned"
+    elif ! flock -n "$LOCK_FILE" true 2>/dev/null; then
+      prov="provisioning in progress"
+    else
+      prov="NOT provisioned (see the Start task log, or run '$0 up $AGENT')"
+    fi
+    echo "$AGENT: CT $CTID running, ${prov}, ip: $(sandbox_ip), firewall: ${fw_info}"
   else
     if park_job_active; then
       echo "$AGENT: CT $CTID stopped: being parked after GUI Stop (unit $PARK_UNIT); GUI Start works when done, firewall: ${fw_info}"
@@ -1442,8 +1493,8 @@ cmd_status() {
 
 # Every ai-sandbox CT on this node, whichever agent and CTID.
 cmd_status_all() {
-  local vmid host state ip found=0
-  printf '%-10s %-6s %-8s %s\n' AGENT CTID STATE IP
+  local vmid host state ip ready found=0
+  printf '%-10s %-6s %-8s %-15s %s\n' AGENT CTID STATE IP PROVISIONED
   for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
     host="$(pct config "$vmid" 2>/dev/null | awk '/^hostname:/ {print $2}')"
     case "$host" in ai-sandbox-?*) ;; *) continue ;; esac
@@ -1451,7 +1502,12 @@ cmd_status_all() {
     state="$(pct status "$vmid" 2>/dev/null | awk '{print $2}')"
     ip=""
     [ "$state" = "running" ] && ip="$(pct exec "$vmid" -- sh -c 'hostname -I 2>/dev/null | cut -d" " -f1' 2>/dev/null || true)"
-    printf '%-10s %-6s %-8s %s\n' "${host#ai-sandbox-}" "$vmid" "${state:-?}" "${ip:--}"
+    ready="-"
+    if [ "$state" = "running" ]; then
+      ready="NO"
+      [ "$(cat "${STATE_DIR}/${host#ai-sandbox-}/provisioned" 2>/dev/null)" = "$vmid" ] && ready="yes"
+    fi
+    printf '%-10s %-6s %-8s %-15s %s\n' "${host#ai-sandbox-}" "$vmid" "${state:-?}" "${ip:--}" "$ready"
   done
   [ "$found" = 1 ] || echo "(no ai-sandbox CTs on this node)"
 }
