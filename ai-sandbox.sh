@@ -18,6 +18,8 @@
 #   agents           list the agent profiles this script knows
 #   bake             build a golden template (every agent CLI) in a free slot;
 #                    sessions then start as linked clones of it (MODE)
+#   timer [on|off]   weekly `bake` via a systemd timer (BAKE_SCHEDULE); no
+#                    argument shows its schedule, next run and last result
 #   refresh-stub     INTERNAL — re-park a pristine stub onto the new golden
 #   update           self-update from main (previous copy kept as .bak)
 #   hook             INTERNAL — called by the PVE hookscript shim (vmid, phase)
@@ -128,6 +130,9 @@ GUARD_STAMP_TTL=600                   # seconds a work-guard pass remains valid
 STORAGE_CFG="${STORAGE_CFG:-/etc/pve/storage.cfg}"  # storage definitions (content/path lookup)
 FW_DIR="${FW_DIR:-/etc/pve/firewall}" # Proxmox firewall config dir (contains cluster.fw & <CTID>.fw)
 PVE_LXC_DIR="${PVE_LXC_DIR:-/etc/pve/lxc}"  # this node's CT configs (read directly; see ct_conf)
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"   # where `timer on` writes its units
+BAKE_UNIT="ai-sandbox-bake"
+UNIT_MARKER="# Managed by ai-sandbox.sh (timer on/off) - edits are overwritten"
 
 apply_defaults() {
   CTID="${CTID:-$PROFILE_CTID}"        # fixed ID per agent = one sandbox per agent
@@ -1615,6 +1620,99 @@ cmd_bake() {
   return 0
 }
 
+# --------------------------- weekly bake timer (#9, part 3) --------------------
+# `timer on` installs ai-sandbox-bake.service (oneshot: this script's `bake`)
+# and ai-sandbox-bake.timer (OnCalendar=$BAKE_SCHEDULE, default Sunday
+# 03:00, Persistent so a missed run happens at next boot, up to 30 min
+# random delay). Settings come from the config files at run time, as in
+# hooks. A bake that cannot run (both golden slots busy) fails the unit
+# and leaves everything as it was; `timer` shows the last result.
+
+timer_schedule_ok() {   # $1 = OnCalendar expression; reject anything that could inject unit lines
+  [[ "$1" =~ ^[A-Za-z0-9\ :*,./~-]+$ ]] || return 1
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze calendar "$1" >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+timer_unit_write() {   # $1 = path, stdin = content; never overwrite a unit we did not write
+  if [ -f "$1" ] && ! grep -qF "$UNIT_MARKER" "$1"; then
+    die "refusing to overwrite $1: not written by this script"
+  fi
+  cat > "$1"
+}
+
+cmd_timer() {   # $1 = on | off | (empty: show)
+  [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
+  local action="${1:-show}" svc="${SYSTEMD_UNIT_DIR}/${BAKE_UNIT}.service" tmr="${SYSTEMD_UNIT_DIR}/${BAKE_UNIT}.timer"
+  BAKE_SCHEDULE="${BAKE_SCHEDULE:-Sun *-*-* 03:00:00}"
+  case "$action" in
+    on)
+      timer_schedule_ok "$BAKE_SCHEDULE" || die "invalid BAKE_SCHEDULE='$BAKE_SCHEDULE' (a systemd OnCalendar expression, e.g. 'Sun *-*-* 03:00:00')"
+      mkdir -p "$SYSTEMD_UNIT_DIR"
+      timer_unit_write "$svc" <<EOF
+$UNIT_MARKER
+[Unit]
+Description=ai-sandbox: bake a fresh golden template
+Wants=network-online.target
+After=network-online.target pve-cluster.service
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=$(readlink -f "$0") bake
+EOF
+      timer_unit_write "$tmr" <<EOF
+$UNIT_MARKER
+[Unit]
+Description=ai-sandbox: weekly golden template bake
+
+[Timer]
+OnCalendar=$BAKE_SCHEDULE
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl daemon-reload
+      systemctl enable --now "${BAKE_UNIT}.timer"
+      echo "bake timer: on ($BAKE_SCHEDULE, up to 30 min later; missed runs catch up at boot)"
+      echo "  runs: $(readlink -f "$0") bake   - logs: journalctl -u ${BAKE_UNIT}.service"
+      ;;
+    off)
+      systemctl disable --now "${BAKE_UNIT}.timer" >/dev/null 2>&1 || true
+      local f
+      for f in "$tmr" "$svc"; do
+        [ -f "$f" ] || continue
+        grep -qF "$UNIT_MARKER" "$f" || die "refusing to remove $f: not written by this script"
+        rm -f "$f"
+      done
+      systemctl daemon-reload
+      echo "bake timer: off (run '$0 bake' by hand when you want a fresh golden)"
+      ;;
+    show)
+      if [ ! -f "$tmr" ]; then
+        echo "bake timer: off (turn it on with: $0 timer on)"
+        return 0
+      fi
+      echo "bake timer: on ($(sed -n 's/^OnCalendar=//p' "$tmr"))"
+      systemctl list-timers "${BAKE_UNIT}.timer" --all --no-pager 2>/dev/null | sed -n '1,2p' | sed 's/^/  /'
+      # systemd reports Result=success for a unit that never ran: check it started
+      local started result
+      started="$(systemctl show "${BAKE_UNIT}.service" -p ExecMainStartTimestamp --value 2>/dev/null)"
+      result="$(systemctl show "${BAKE_UNIT}.service" -p Result --value 2>/dev/null)"
+      if [ -z "$started" ] || [ "$started" = "n/a" ]; then
+        echo "  last bake: never run yet (to run one now: systemctl start ${BAKE_UNIT}.service)"
+      else
+        echo "  last bake: ${result:-unknown} (started $started) - logs: journalctl -u ${BAKE_UNIT}.service"
+      fi
+      ;;
+    *) die "usage: $0 timer [on|off]" ;;
+  esac
+}
+
 print_golden_summary() {   # one line per golden slot that exists, for `status`
   local cur vmid host role users
   cur="$(golden_current)"
@@ -1631,6 +1729,9 @@ print_golden_summary() {   # one line per golden slot that exists, for `status`
       printf 'golden: CT %s NOT a template (failed or interrupted bake; the next bake replaces it)\n' "$vmid"
     fi
   done
+  [ -f "${SYSTEMD_UNIT_DIR}/${BAKE_UNIT}.timer" ] \
+    && echo "bake timer: on ($(sed -n 's/^OnCalendar=//p' "${SYSTEMD_UNIT_DIR}/${BAKE_UNIT}.timer")) - details: $0 timer"
+  return 0
 }
 
 # --------------------------- subcommands ------------------------------------
@@ -2037,6 +2138,7 @@ case "$cmd" in
   status) [ -z "${1:-${AGENT:-}}" ] || select_agent "${1:-}" ;;
   bake)   select_golden ;;
   refresh-stub) select_agent "${1:-}" ;;
+  timer)  load_config_file "${STATE_DIR}/config.env" ;;
   park-deferred)   # <agent> <vmid>: the vmid wins over config, as in hooks
     [[ "${2:-}" =~ ^[0-9]+$ ]] || die "park-deferred: usage: $0 park-deferred <agent> <vmid>"
     CTID="$2"; select_agent "${1:-}" ;;
@@ -2057,6 +2159,7 @@ case "$cmd" in
   park-deferred) cmd_park_deferred ;;
   bake)   cmd_bake ;;
   refresh-stub) cmd_refresh_stub ;;
+  timer)  cmd_timer "${1:-}" ;;
   *) awk 'NR == 1 || /^# ====/ {next} /^set -/ {exit} /^#/ {sub(/^# ?/, ""); print}' "$0"; exit 1 ;;
 esac
 

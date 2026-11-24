@@ -23,7 +23,7 @@ fresh() {   # new isolated world; sets T and S (script copy)
   rm -f /run/lock/ai-sandbox.*
 }
 run() {   # run the script copy in the mock world
-  env PATH="$HERE/bin:$PATH" HOME="$T/home" STATE_DIR="$T/state" FW_DIR="$T/fw" PVE_LXC_DIR="$T/conf" \
+  env PATH="$HERE/bin:$PATH" HOME="$T/home" STATE_DIR="$T/state" FW_DIR="$T/fw" PVE_LXC_DIR="$T/conf" SYSTEMD_UNIT_DIR="$T/units" \
       HOOK_SNIPPET_DIR="$T/snip" AUTO_UPDATE=off TEMPLATE=local:vztmpl/debian-12.tar.zst \
       EXPORT_DIR="$T/export" "$@"
 }
@@ -517,6 +517,42 @@ B FORCE=1 RESCUE=0 "$S" up mistral >/dev/null 2>&1
 check_sh "the next up moves mistral to the current golden" '[ "$(origin_of 1051)" = base-1049-disk-0 ]'
 out="$(B "$S" bake 2>&1)"; rc=$?
 check_sh "so the third bake can reuse slot 1048" '[ $rc -eq 0 ] && [ "$(cat "$T/state/golden/current")" = 1048 ]'
+
+echo "== weekly bake timer (#9c)"
+fresh
+out="$(run "$S" timer 2>&1)"
+check "timer with no units: off, with a hint" grep -q 'bake timer: off (turn it on with: .* timer on)' <<<"$out"
+: > "$T/calls.log"
+out="$(run "$S" timer on 2>&1)"; rc=$?
+check "timer on exits 0" [ $rc -eq 0 ]
+check_sh "  ...service runs this script's bake, oneshot" 'grep -qx "ExecStart=$S bake" "$T/units/ai-sandbox-bake.service" && grep -qx "Type=oneshot" "$T/units/ai-sandbox-bake.service"'
+check_sh "  ...timer: weekly default, persistent, jittered" 'grep -qx "OnCalendar=Sun \*-\*-\* 03:00:00" "$T/units/ai-sandbox-bake.timer" && grep -qx "Persistent=true" "$T/units/ai-sandbox-bake.timer" && grep -qx "RandomizedDelaySec=30min" "$T/units/ai-sandbox-bake.timer"'
+check_sh "  ...reloaded and enabled" 'grep -qx "systemctl daemon-reload" "$T/calls.log" && grep -qx "systemctl enable --now ai-sandbox-bake.timer" "$T/calls.log"'
+out="$(run "$S" timer 2>&1)"
+check_sh "timer shows schedule and next run" 'grep -q "^bake timer: on (Sun \*-\*-\* 03:00:00)" <<<"$out" && grep -q "ai-sandbox-bake.timer" <<<"$out"'
+check "  ...and a bake that never ran as 'never run yet', not 'success'" grep -q 'last bake: never run yet' <<<"$out"
+echo exit-code > "$T/bake-ran"
+out="$(run "$S" timer 2>&1)"
+check "  ...and a failed last bake as failed, with when" grep -q 'last bake: exit-code (started Sun 2026-11-29 03:21:18 GMT)' <<<"$out"
+rm -f "$T/bake-ran"
+out="$(run "$S" status 2>&1)"
+check "status (all) mentions the timer" grep -q '^bake timer: on (Sun \*-\*-\* 03:00:00) - details: .* timer' <<<"$out"
+printf 'BAKE_SCHEDULE="Wed *-*-* 02:30:00"\n' > "$T/state/config.env"
+run "$S" timer on >/dev/null 2>&1
+check "BAKE_SCHEDULE from the config file" grep -qx 'OnCalendar=Wed \*-\*-\* 02:30:00' "$T/units/ai-sandbox-bake.timer"
+out="$(run BAKE_SCHEDULE='weekly
+ExecStartPre=/bin/evil' "$S" timer on 2>&1)"; rc=$?
+check_sh "a schedule that would inject unit lines is refused" '[ $rc -ne 0 ] && grep -q "invalid BAKE_SCHEDULE" <<<"$out" && ! grep -q evil "$T/units/ai-sandbox-bake.timer"'
+out="$(run BAKE_SCHEDULE='not a date' "$S" timer on 2>&1)"; rc=$?
+check_sh "an unparseable schedule is refused (systemd-analyze)" '[ $rc -ne 0 ] || ! command -v systemd-analyze >/dev/null'
+: > "$T/calls.log"
+out="$(run "$S" timer off 2>&1)"; rc=$?
+check_sh "timer off disables and removes both units" '[ $rc -eq 0 ] && grep -qx "systemctl disable --now ai-sandbox-bake.timer" "$T/calls.log" && [ ! -e "$T/units/ai-sandbox-bake.timer" ] && [ ! -e "$T/units/ai-sandbox-bake.service" ]'
+printf '[Timer]\nOnCalendar=daily\n' > "$T/units/ai-sandbox-bake.timer"
+out="$(run "$S" timer on 2>&1)"; rc=$?
+check_sh "a unit file not written by the script is never overwritten" '[ $rc -ne 0 ] && grep -q "refusing to overwrite" <<<"$out" && grep -qx "OnCalendar=daily" "$T/units/ai-sandbox-bake.timer"'
+out="$(run "$S" timer off 2>&1)"; rc=$?
+check_sh "...or removed" '[ $rc -ne 0 ] && grep -q "refusing to remove" <<<"$out" && [ -e "$T/units/ai-sandbox-bake.timer" ]'
 
 echo
 echo "passed: $pass  failed: $fail"
