@@ -230,6 +230,26 @@ out="$(run "$S" update 2>&1)"; rc=$?
 check "update refuses in a git checkout, pointing at git pull" [ $rc -ne 0 ] && grep -q 'git -C .* pull' <<<"$out"
 rm -rf "$T/.git"
 
+echo "== IPv6: EGRESS_DENY and the public-IPv6 warning"
+fresh
+V6="2a10:d585:7f66:2:56:1dff:fef2:f487 2a10:d585:7f66:0:56:1dff:fef2:f487"
+out="$(run "$S" up mistral 2>&1)"
+check "no IPv6 in the sandbox -> no IPv6 warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+out="$(run MOCK_IPV6="$V6" FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "public IPv6 + lan-block + no EGRESS_DENY -> warning" grep -q 'the mistral sandbox has public IPv6 address' <<<"$out"
+check "  ...lists the addresses" grep -q '2a10:d585:7f66:0:56:1dff:fef2:f487/64' <<<"$out"
+check "  ...and suggests the /48" grep -q 'EGRESS_DENY=2a10:d585:7f66::/48' <<<"$out"
+out="$(run MOCK_IPV6="$V6" EGRESS_DENY=2a10:d585:7f66::/48 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "EGRESS_DENY set -> no warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+check "  ...and the .fw drops the site range" grep -q '^OUT DROP -dest 2a10:d585:7f66::/48 -log nolog # EGRESS_DENY' "$T/fw/1051.fw"
+check "  ...before the private-range drops" bash -c "[ \$(grep -n 'EGRESS_DENY' '$T/fw/1051.fw' | cut -d: -f1) -lt \$(grep -n '10.0.0.0/8' '$T/fw/1051.fw' | cut -d: -f1) ]"
+out="$(run EGRESS_DENY=2a10:d585:7f66::/48 EGRESS_ALLOW=2a10:d585:7f66:2::50/128 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "EGRESS_ALLOW still punches a hole first" bash -c "[ \$(grep -n 'EGRESS_ALLOW' '$T/fw/1051.fw' | cut -d: -f1) -lt \$(grep -n 'EGRESS_DENY' '$T/fw/1051.fw' | cut -d: -f1) ]"
+out="$(run EGRESS_DENY='2a10::/48;DROP' "$S" up mistral 2>&1)"; rc=$?
+check "invalid EGRESS_DENY entry rejected (no .fw injection)" [ $rc -ne 0 ] && grep -q "invalid IP/CIDR '2a10::/48;DROP' in EGRESS_DENY" <<<"$out"
+out="$(run MOCK_IPV6="$V6" EGRESS_POLICY=strict FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "strict policy (drops everything) -> no IPv6 warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

@@ -150,6 +150,7 @@ apply_defaults() {
   FIREWALL="${FIREWALL:-on}"           # on = attach PVE firewall=1 and write per-CT rules
   EGRESS_POLICY="${EGRESS_POLICY:-lan-block}"     # lan-block | strict | off
   EGRESS_ALLOW="${EGRESS_ALLOW:-}"     # optional comma-separated IPs/CIDRs allowed outbound
+  EGRESS_DENY="${EGRESS_DENY:-}"       # extra CIDRs lan-block drops: your site's PUBLIC IPv6 range(s)
   PROVISION_HOOKS=("$(dirname "$(readlink -f "$0")")/provision.sh" "${INSTANCE_DIR}/provision.sh")
   [[ "$CTID" =~ ^[0-9]+$ ]] && [ "$CTID" -ge 100 ] || die "invalid CTID '$CTID'"
 }
@@ -706,17 +707,30 @@ validate_hardening_config() {
     lan-block|strict|off) ;;
     *) die "invalid EGRESS_POLICY='$EGRESS_POLICY' (expected 'lan-block', 'strict', or 'off')" ;;
   esac
-  if [ -n "$EGRESS_ALLOW" ]; then
-    local saved_ifs="$IFS" entry
+  local var saved_ifs entry
+  for var in EGRESS_ALLOW EGRESS_DENY; do
+    [ -n "${!var}" ] || continue
+    saved_ifs="$IFS"
     IFS=','
-    for entry in $EGRESS_ALLOW; do
+    for entry in ${!var}; do
       IFS="$saved_ifs"
       entry="$(printf '%s' "$entry" | tr -d ' \t')"
       [ -n "$entry" ] || continue
-      validate_cidr_or_ip "$entry" || die "invalid IP/CIDR '$entry' in EGRESS_ALLOW"
+      validate_cidr_or_ip "$entry" || die "invalid IP/CIDR '$entry' in $var"
     done
     IFS="$saved_ifs"
-  fi
+  done
+}
+
+csv_entries() {   # $1 = comma-separated list; prints one trimmed entry per line
+  local saved_ifs="$IFS" entry
+  IFS=','
+  for entry in $1; do
+    IFS="$saved_ifs"
+    entry="$(printf '%s' "$entry" | tr -d ' \t')"
+    [ -n "$entry" ] && printf '%s\n' "$entry"
+  done
+  IFS="$saved_ifs"
 }
 
 bool_word() {   # on|off -> true|false (valid in TOML and JSON alike)
@@ -735,6 +749,24 @@ datacenter_firewall_enabled() {
     in_opt && /^[[:space:]]*enable:[[:space:]]*1([[:space:]]*(#.*)?)?$/ { found = 1; exit }
     END { exit(found ? 0 : 1) }
   ' "$cluster_fw" 2>/dev/null
+}
+
+# lan-block's built-in ranges are all private; a sandbox holding a PUBLIC
+# IPv6 address can reach your LAN devices' public IPv6 addresses unless
+# EGRESS_DENY lists your site's range. Warn when that gap is open.
+warn_public_ipv6() {
+  [ "$FIREWALL" = "on" ] && [ "$EGRESS_POLICY" = "lan-block" ] || return 0
+  [ -z "$EGRESS_DENY" ] || return 0
+  local addrs first suggest=""
+  addrs="$(ct_run ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | sort -u)"
+  [ -n "$addrs" ] || return 0
+  first="$(head -n1 <<<"$addrs")"
+  [[ "$first" =~ ^([0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}): ]] && suggest="${BASH_REMATCH[1]}::/48"
+  echo "warning: the $AGENT sandbox has public IPv6 address(es):"
+  sed 's/^/    /' <<<"$addrs"
+  echo "  lan-block only drops private ranges, so your LAN devices' public IPv6 addresses are reachable."
+  echo "  set your site's delegated prefix in ${STATE_DIR}/config.env, e.g.:"
+  echo "    EGRESS_DENY=${suggest:-<your ISP-delegated IPv6 prefix>}"
 }
 
 warn_datacenter_firewall() {
@@ -773,6 +805,13 @@ EOF
     IFS="$saved_ifs"
   fi
   if [ "$EGRESS_POLICY" = "lan-block" ]; then
+    # Your LAN is not only RFC1918: with native IPv6, every device also has
+    # a PUBLIC address in the ISP-delegated prefix, which no private-range
+    # rule matches. EGRESS_DENY carries that range (e.g. your /48).
+    local entry
+    while IFS= read -r entry; do
+      printf 'OUT DROP -dest %s -log nolog # EGRESS_DENY (site range)\n' "$entry"
+    done < <(csv_entries "$EGRESS_DENY")
     cat <<'EOF'
 OUT DROP -dest 10.0.0.0/8 -log nolog # block RFC1918 LAN
 OUT DROP -dest 172.16.0.0/12 -log nolog # block RFC1918 LAN
@@ -1063,6 +1102,7 @@ cmd_up() {
 
   provision_and_report
   print_hardening_summary
+  warn_public_ipv6
   warn_datacenter_firewall
 
   echo "sandbox ready."
@@ -1289,6 +1329,7 @@ cmd_hook() {
       purge_known_hosts "$ip"
       provision_and_report
       print_hardening_summary
+      warn_public_ipv6
       warn_datacenter_firewall
       echo "$AGENT sandbox ready via GUI."
       print_ssh_line "$ip"

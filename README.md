@@ -312,6 +312,7 @@ Settings (all optional):
 | `FIREWALL` | `on` | attach `firewall=1` and manage `/etc/pve/firewall/<CTID>.fw` |
 | `EGRESS_POLICY` | `lan-block` | `lan-block` / `strict` / `off` |
 | `EGRESS_ALLOW` | — | comma-separated IPs/CIDRs allowed outbound |
+| `EGRESS_DENY` | — | extra CIDRs `lan-block` drops — set it to your site's public IPv6 prefix (e.g. your /48) |
 | `FW_DIR` | `/etc/pve/firewall` | Proxmox firewall config directory |
 | `STATE_DIR` | `/root/.ai-sandbox` | host state root (environment only) |
 
@@ -578,6 +579,21 @@ writes `/etc/pve/firewall/<CTID>.fw` **before** the container boots:
 | `strict` | `DROP` except SSH (`TCP 22`) | `policy_out: DROP`; allows **only** DHCP, DNS, and `EGRESS_ALLOW` |
 | `off` | Unmanaged | Unmanaged (`firewall=1` omitted; managed `.fw` removed) |
 
+**Native IPv6 needs one setting.** `lan-block`'s built-in ranges are all
+private. If your network has public IPv6, the sandbox picks up a public
+address from your router like any other device, and every LAN device's
+public IPv6 address is reachable through a rule set that only knows
+private ranges. List your ISP-delegated prefix in `EGRESS_DENY`, once,
+for every agent:
+
+```bash
+echo 'EGRESS_DENY=2a10:d585:7f66::/48' >> /root/.ai-sandbox/config.env   # your prefix
+```
+
+`up` and GUI Start warn when a sandbox has public IPv6 and `EGRESS_DENY`
+is empty, and suggest the /48 from the sandbox's own address.
+`EGRESS_ALLOW` still punches holes before it.
+
 ```bash
 # Allow one internal LAN Git server while keeping the rest of the LAN blocked
 EGRESS_ALLOW=192.168.3.50/32 /root/ai-sandbox.sh up mistral
@@ -749,6 +765,11 @@ PVE hookscript.)
 - `warning: Proxmox Datacenter firewall is disabled` — per-CT egress
   rules are written but not enforced; see the
   [prerequisite](#2-host-enforced-proxmox-lxc-firewall-outside-container-control).
+- `warning: the <agent> sandbox has public IPv6 address(es)` — your
+  network hands out public IPv6, which `lan-block`'s private ranges do
+  not cover. Set `EGRESS_DENY` to your delegated prefix (see
+  [layer 2](#2-host-enforced-proxmox-lxc-firewall-outside-container-control))
+  and rebuild (`down`, or `up`).
 - The container cannot reach a LAN Git server, proxy, or registry —
   expected under `lan-block`. Punch a surgical hole with
   `EGRESS_ALLOW=<ip>/32`.
