@@ -284,7 +284,9 @@ CT 1053, hostname `ai-sandbox-gemini`.
   (its "safe mode"), not even `~/.gemini/.env`, so a small launcher at
   `/usr/local/bin/gemini` reads the key from that one sandbox file and
   starts the real CLI. Folder trust stays on: an untrusted project's own
-  `.env` and settings are still ignored.
+  `.env` and settings are still ignored. Interactive `gemini` asks once
+  whether to trust a folder; headless `gemini -p` in an untrusted folder
+  refuses to run, so scripts pass `--skip-trust` (or trust the folder first).
 - **Policy**: `/etc/gemini-cli/settings.json`, the system settings file,
   which overrides user and project settings. By default it disables YOLO
   mode and "Always allow" (`security.disableYoloMode`,
