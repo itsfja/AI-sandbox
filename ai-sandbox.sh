@@ -890,7 +890,9 @@ inject_agent_policy() {
 
 print_hardening_summary() {
   local fw_state="off" agent_state="off"
-  if firewall_active; then
+  if firewall_active && ! grep -qsF "$FW_MARKER" "${FW_DIR}/${CTID}.fw"; then
+    fw_state="${EGRESS_POLICY} (RULESET MISSING: ${FW_DIR}/${CTID}.fw)"
+  elif firewall_active; then
     if datacenter_firewall_enabled; then
       fw_state="${EGRESS_POLICY} (active)"
     else
@@ -984,6 +986,9 @@ clone_sandbox() {   # $1 = golden CTID, $2 = start|stopped, $3 = net0, "${@:4}" 
   shift 3
   echo "cloning CT $CTID from golden CT $golden (linked clone) ..."
   pct clone "$golden" "$CTID" --hostname "$CTHOST" --full 0
+  # pct clone replaces the target's firewall file with the source's (it
+  # deletes ours, and the golden has none): write this CT's ruleset again
+  configure_firewall
   pct set "$CTID" \
     --cores "$CORES" --memory "$RAM_MB" --swap "$SWAP_MB" \
     --net0 "$net0" \
@@ -997,12 +1002,36 @@ clone_sandbox() {   # $1 = golden CTID, $2 = start|stopped, $3 = net0, "${@:4}" 
   elif [ -n "$size" ] && [ "$DISK_GB" -lt "$size" ]; then
     echo "note: DISK_GB=$DISK_GB is below the golden's ${size}G; a clone cannot shrink, keeping ${size}G" >&2
   fi
+  assert_firewall_in_place
   [ "$mode" = start ] && pct start "$CTID"
   return 0
 }
 
-ct_golden_base() {   # echoes the golden CTID this CT is a linked clone of, if any
-  pct config "$CTID" 2>/dev/null | sed -n 's/^rootfs: [^ ]*base-\([0-9]*\)-disk-.*/\1/p' | head -n1
+# Which template a CT's rootfs is a linked clone of. The volume ID alone
+# does not say on every storage: zfspool/rbd name a clone
+# "base-<id>-disk-N/<own volume>", but lvmthin names it plainly
+# "vm-<ctid>-disk-N" (seen on pve1); only its LVM origin is the base.
+ct_golden_base() {   # $1 = CTID (default $CTID); echoes the template CTID, if any
+  local id="${1:-$CTID}" volid dev origin
+  volid="$(pct config "$id" 2>/dev/null | sed -n 's/^rootfs: \([^,]*\).*/\1/p' | head -n1)"
+  [ -n "$volid" ] || return 0
+  if [[ "$volid" =~ :base-([0-9]+)-disk-[0-9]+/ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  dev="$(pvesm path "$volid" 2>/dev/null)" || return 0
+  [[ "$dev" == /dev/* ]] || return 0
+  origin="$(lvs --noheadings -o origin "$dev" 2>/dev/null | tr -d ' ')"
+  [[ "$origin" =~ ^base-([0-9]+)-disk-[0-9]+$ ]] && echo "${BASH_REMATCH[1]}"
+  return 0
+}
+
+# Fail closed: never start a sandbox whose host-side ruleset is missing.
+assert_firewall_in_place() {
+  firewall_active || return 0
+  local fw="${FW_DIR}/${CTID}.fw"
+  [ -f "$fw" ] && grep -qF "$FW_MARKER" "$fw" \
+    || die "firewall: managed ruleset $fw is missing - refusing to start an unfiltered sandbox"
 }
 
 # Per-session provisioning of a clone (everything else is baked in).
@@ -1357,7 +1386,7 @@ golden_clones_of() {   # $1 = golden CTID; echoes CTs whose rootfs is a linked c
   local vmid
   for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
     [ "$vmid" = "$1" ] && continue
-    pct config "$vmid" 2>/dev/null | grep -qE "^rootfs: [^ ]*base-${1}-disk-" && echo "$vmid"
+    [ "$(ct_golden_base "$vmid")" = "$1" ] && echo "$vmid"
   done
   return 0
 }

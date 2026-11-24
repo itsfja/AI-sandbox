@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Mock pvesm: `path <storage>:<volume>` -> /dev/pve/<volume> (lvm-style).
 echo "pvesm $*" >> "$MOCK_T/calls.log"
-[ "$1" = path ] && echo /dev/mock-thin-$RANDOM
+if [ "$1" = path ]; then
+  case "$2" in
+    *:*/*) echo "/dev/zvol/mock/${2##*/}" ;;
+    *:*)   echo "/dev/pve/${2#*:}" ;;
+    *)     echo "/dev/mock-thin-$RANDOM" ;;
+  esac
+fi
 exit 0

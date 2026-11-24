@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Mock lvs: only `lvs --noheadings -o origin /dev/<vg>/<lv>`; the origin of a
+# linked clone comes from $MOCK_T/lvorigin/<lv> (written by the pct mock).
+echo "lvs $*" >> "$MOCK_T/calls.log"
+lv="${*: -1}"; lv="${lv##*/}"
+[ -f "$MOCK_T/lvorigin/$lv" ] && echo "  $(cat "$MOCK_T/lvorigin/$lv")"
+exit 0

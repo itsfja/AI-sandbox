@@ -28,6 +28,7 @@ run() {   # run the script copy in the mock world
       EXPORT_DIR="$T/export" "$@"
 }
 calls_lack() { ! grep -qE "$1" "$T/calls.log"; }
+origin_of() { cat "$T/lvorigin/vm-$1-disk-0" 2>/dev/null; }   # lvmthin: a linked clone's LVM origin
 hookvars() {   # what reaches an env-less hook or systemd unit: the config, not your shell
   echo "STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst"
 }
@@ -443,7 +444,7 @@ B FORCE=1 RESCUE=0 "$S" down mistral >/dev/null 2>&1   # a full-build stub, park
 out="$(B "$S" bake 2>&1)"; rc=$?
 check "bake exits 0" [ $rc -eq 0 ]
 [ $rc -eq 0 ] || echo "$out" | tail -8
-check_sh "  ...and moves the pristine full-build stub onto the golden" 'grep -q "refresh: re-parking the mistral stub (CT 1051) onto golden CT 1048" <<<"$out" && grep -q "^rootfs: local-lvm:base-1048-disk-0/vm-1051-disk-0" "$T/conf/1051.conf" && [ -e "$T/state/mistral/pristine-stub" ]'
+check_sh "  ...and moves the pristine full-build stub onto the golden" 'grep -q "refresh: re-parking the mistral stub (CT 1051) onto golden CT 1048" <<<"$out" && [ "$(origin_of 1051)" = base-1048-disk-0 ] && [ -e "$T/state/mistral/pristine-stub" ]'
 : > "$T/calls.log"
 out="$(B FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"; rc=$?
 check "up after a bake exits 0" [ $rc -eq 0 ]
@@ -460,8 +461,14 @@ check "  ...regenerates SSH host keys" grep -q "pct exec 1051 -- env -i .* bash 
 check_sh "  ...pushes root's authorized key" 'cmp -s "$T/state/ssh/ai-sandbox.pub" "$T/ct/1051/root/.ssh/authorized_keys"'
 check_sh "  ...injects the policy and marks it provisioned" '[ -f "$T/ct/1051/root/.vibe/config.toml" ] && [ "$(cat "$T/state/mistral/provisioned")" = 1051 ]'
 check "  ...prints the ssh line" grep -q 'sandbox ready.' <<<"$out"
+check "  ...its rootfs is a plain lvmthin volume (as on pve1)" grep -q '^rootfs: local-lvm:vm-1051-disk-0,' "$C1"
+check_sh "  ...and the host-side firewall ruleset survives pct clone" 'grep -q "^# ai-sandbox managed firewall (CT 1051" "$T/fw/1051.fw" && grep -q "OUT DROP -dest 192.168.0.0/16" "$T/fw/1051.fw"'
+check_sh "  ...rewritten after the clone, before the start" '[ $(grep -n "^pct clone 1048 1051" "$T/calls.log" | cut -d: -f1) -lt $(grep -n "^pct start 1051" "$T/calls.log" | cut -d: -f1) ]'
+check_sh "  ...summary reports it active, not missing" 'grep -q "hardening: firewall=lan-block (pending Datacenter firewall)" <<<"$out"'
 out="$(B "$S" status mistral 2>&1)"
 check "status: built from golden CT 1048 (current)" grep -q '^  built from: golden CT 1048 (current)$' <<<"$out"
+out="$(B MOCK_CLONE_STYLE=zfs FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check_sh "zfs-style clone volume (base-N/...) is recognised too" 'grep -q "^rootfs: local-zfs:base-1048-disk-0/subvol-1051" "$C1" && calls_lack "bash /root/provision-base.sh" && [ -f "$T/fw/1051.fw" ]'
 out="$(B DISK_GB=60 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
 check "DISK_GB above the golden's size grows the clone" grep -q '^pct resize 1051 rootfs 60G$' "$T/calls.log"
 out="$(B DISK_GB=20 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
@@ -490,13 +497,18 @@ B "$S" up fake >/dev/null 2>&1
 B FORCE=1 RESCUE=0 "$S" down fake >/dev/null 2>&1
 check "the fake agent is not in the golden: its stub is a full build" grep -q '^rootfs: local-lvm:' "$T/conf/1059.conf"
 out="$(B BAKE_AGENTS=mistral,fake "$S" bake 2>&1)"; rc=$?
+out2="$(B "$S" status 2>&1)"
+check "status (all) sees the lvmthin clone of the previous golden" grep -q '^golden: CT 1048 template (previous), linked clones: 1051' <<<"$out2"
 check_sh "second bake (both agents) goes to 1049" '[ $rc -eq 0 ] && [ "$(cat "$T/state/golden/current")" = 1049 ]'
-check_sh "  ...the running mistral clone is left on 1048" 'grep -q "base-1048-disk-0/vm-1051" "$T/conf/1051.conf" && [ -e "$T/run/1051" ]'
-check_sh "  ...the fake stub moves onto 1049" 'grep -q "base-1049-disk-0/vm-1059" "$T/conf/1059.conf" && [ -e "$T/state/fake/pristine-stub" ]'
+check_sh "  ...the running mistral clone is left on 1048" '[ "$(origin_of 1051)" = base-1048-disk-0 ] && [ -e "$T/run/1051" ]'
+check_sh "  ...the fake stub moves onto 1049" '[ "$(origin_of 1059)" = base-1049-disk-0 ] && [ -e "$T/state/fake/pristine-stub" ]'
 out="$(B "$S" status mistral 2>&1)"
 check "status flags the previous golden" grep -q 'built from: golden CT 1048 (previous; the next park or up moves it' <<<"$out"
+: > "$T/calls.log"
+out="$(B "$S" bake 2>&1)"; rc=$?
+check_sh "a bake now refuses: slot 1048 backs the running lvmthin clone 1051" '[ $rc -ne 0 ] && grep -q "CT 1048 still backs linked clone(s): 1051" <<<"$out" && calls_lack "^pct destroy 1048"'
 B FORCE=1 RESCUE=0 "$S" up mistral >/dev/null 2>&1
-check "the next up moves mistral to the current golden" grep -q 'base-1049-disk-0/vm-1051' "$T/conf/1051.conf"
+check_sh "the next up moves mistral to the current golden" '[ "$(origin_of 1051)" = base-1049-disk-0 ]'
 out="$(B "$S" bake 2>&1)"; rc=$?
 check_sh "so the third bake can reuse slot 1048" '[ $rc -eq 0 ] && [ "$(cat "$T/state/golden/current")" = 1048 ]'
 
