@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # ai-sandbox.sh — single-use, rebuild-on-demand LXC sandboxes for AI coding
-#                 agents on Proxmox VE (Mistral Vibe today; Claude Code,
+#                 agents on Proxmox VE (Mistral Vibe and Claude Code today;
 #                 Gemini CLI and drop-in profiles to follow)
 #
 # Usage:  ai-sandbox.sh <command> [agent]        (or AGENT=<agent> in env)
@@ -237,6 +237,101 @@ EOF
   ct_push_file "$tmp" /root/.vibe/config.toml 400 || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
   echo "hardening: injected /root/.vibe/config.toml"
+}
+
+# ---- claude: Claude Code ------------------------------------------------------
+profile_claude_meta() {
+  PROFILE_CTID=1052
+  PROFILE_LABEL="Claude Code"
+  PROFILE_VSCODE_EXT="anthropic.claude-code"
+}
+
+# Native installer: one binary, no Node; the launcher is ~/.local/bin/claude.
+# Native installs also update themselves in the background, so a clone's
+# Claude Code is at least as new as the bake, usually newer.
+profile_claude_install() {
+  cat <<'EOF'
+curl -fsSL https://claude.ai/install.sh | bash
+ln -sf /root/.local/bin/claude /usr/local/bin/claude 2>/dev/null || true
+EOF
+}
+
+profile_claude_verify() { echo "claude --version"; }
+
+# secrets.env holds ONE of (parsed here, never executed):
+#   ANTHROPIC_API_KEY=sk-ant-api...       a Claude Console API key
+#   CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat... a subscription token from `claude
+#                                         setup-token` (Pro/Max/Team/Enterprise,
+#                                         valid one year, model requests only)
+# It reaches Claude Code through the `env` block of the user settings file,
+# which the CLI and the VS Code extension both read.
+profile_claude_credentials() {
+  local api oauth tmp key val
+  api="$(secrets_get ANTHROPIC_API_KEY "$SECRETS_FILE")"
+  oauth="$(secrets_get CLAUDE_CODE_OAUTH_TOKEN "$SECRETS_FILE")"
+  [ -n "$api" ] || [ -n "$oauth" ] \
+    || die "no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN line in $SECRETS_FILE"
+  if [ -n "$api" ] && [ -n "$oauth" ]; then
+    echo "warning: $SECRETS_FILE sets both; Claude Code uses ANTHROPIC_API_KEY first" >&2
+  fi
+  for key in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+    val="$(secrets_get "$key" "$SECRETS_FILE")"
+    [ -z "$val" ] || [[ "$val" =~ ^[A-Za-z0-9_.-]+$ ]] \
+      || die "$key in $SECRETS_FILE has characters a key or token never contains"
+  done
+  tmp="$(mktemp)"
+  {
+    printf '{\n  "env": {'
+    [ -n "$api" ] && printf '\n    "ANTHROPIC_API_KEY": "%s"%s' "$api" "$([ -n "$oauth" ] && echo ,)"
+    [ -n "$oauth" ] && printf '\n    "CLAUDE_CODE_OAUTH_TOKEN": "%s"' "$oauth"
+    printf '\n  }\n}\n'
+  } > "$tmp"
+  ct_push_file "$tmp" /root/.claude/settings.json 600 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  echo "credentials injected (host: $SECRETS_FILE -> CT: /root/.claude/settings.json env)"
+}
+
+profile_claude_credential_paths() { echo /root/.claude/settings.json; }
+
+profile_claude_credentials_hint() {
+  echo "  either a Claude Console API key:"
+  echo "    printf 'ANTHROPIC_API_KEY=<key>\\n' > $SECRETS_FILE && chmod 600 $SECRETS_FILE"
+  echo "  or your subscription: run 'claude setup-token' anywhere with a browser, then:"
+  echo "    printf 'CLAUDE_CODE_OAUTH_TOKEN=<token>\\n' > $SECRETS_FILE && chmod 600 $SECRETS_FILE"
+}
+
+# Managed settings outrank every user/project/--settings value in the CT.
+profile_claude_policy() {
+  local tmp parts=()
+  [ "$AGENT_AUTO_APPROVE" = on ] || parts+=('"permissions": { "disableBypassPermissionsMode": "disable" }' '"disableAutoMode": "disable"')
+  [ "$AGENT_CONNECTORS" = on ] || parts+=('"disableClaudeAiConnectors": true')
+  [ "$AGENT_MCP" = on ] || parts+=('"allowedMcpServers": []' '"enableAllProjectMcpServers": false')
+  tmp="$(mktemp)"
+  {
+    echo "{"
+    local i
+    for i in "${!parts[@]}"; do
+      printf '  %s%s\n' "${parts[$i]}" "$([ "$i" -lt $((${#parts[@]} - 1)) ] && echo ,)"
+    done
+    echo "}"
+  } > "$tmp"
+  ct_push_file "$tmp" /etc/claude-code/managed-settings.json 444 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  echo "hardening: injected /etc/claude-code/managed-settings.json"
+}
+
+# One KEY=value from a secrets file, parsed like the config files (never
+# executed; one pair of surrounding quotes stripped). Empty if absent.
+secrets_get() {   # $1 = key, $2 = file
+  local line val
+  [ -f "$2" ] || return 0
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "$2" | tail -n1)" || return 0
+  val="${line#*=}"
+  val="${val%$'\r'}"
+  if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
+    val="${BASH_REMATCH[1]}"
+  fi
+  printf '%s' "$val"
 }
 
 # --------------------------- helpers ---------------------------------------

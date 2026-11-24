@@ -69,7 +69,7 @@ fresh
 out="$(run "$S" agents)"; check "agents lists mistral with CT 1051" grep -q 'mistral *CT 1051 *Mistral Vibe CLI' <<<"$out"
 out="$(run "$S" up 2>&1)"; rc=$?
 check "up without agent fails" [ $rc -ne 0 ]
-check "  ...and names known agents" grep -q 'known agents: mistral' <<<"$out"
+check "  ...and names known agents" grep -q 'known agents: claude mistral' <<<"$out"
 out="$(run "$S" up bogus 2>&1)"; check "unknown agent rejected" grep -q "unknown agent 'bogus'" <<<"$out"
 out="$(run "$S" up 'Mistral;rm' 2>&1)"; check "invalid agent name rejected" grep -q "unknown agent" <<<"$out"
 out="$(run AGENT=mistral "$S" status 2>&1)"; check "AGENT env works for status" grep -q '^mistral: no sandbox (CT 1051 absent)' <<<"$out"
@@ -390,7 +390,8 @@ check "  ...strips SSH host keys, machine-id, authorized_keys" grep -qF 'rm -f /
 check "  ...and makes clones generate their own host keys at boot" grep -qF 'ExecStartPre=/usr/bin/ssh-keygen -A' "$T/calls.log"
 check "  ...checks every credential path" grep -q 'lxc-attach -n 1048 --clear-env -- env -i .* test -e /root/.vibe/.env$' "$T/calls.log"
 check_sh "  ...never injects a credential or policy" '! grep -q "/root/.vibe/.env\|config.toml" <(find "$T/ct/1048" -type f)'
-check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
+check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=claude,mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
+check "  ...with every agent's CLI (BAKE_AGENTS=all)" grep -q 'curl -fsSL https://claude.ai/install.sh | bash' "$T/ct/1048/root/provision-base.sh"
 check "  ...records it as current on the host" [ "$(cat "$T/state/golden/current")" = 1048 ]
 check "  ...build-time firewall removed (the template never runs)" [ ! -e "$T/fw/1048.fw" ]
 check_sh "  ...stop happens before template" '[ $(grep -n "^pct stop 1048" "$T/calls.log" | cut -d: -f1) -lt $(grep -n "^pct template 1048" "$T/calls.log" | cut -d: -f1) ]'
@@ -553,6 +554,42 @@ out="$(run "$S" timer on 2>&1)"; rc=$?
 check_sh "a unit file not written by the script is never overwritten" '[ $rc -ne 0 ] && grep -q "refusing to overwrite" <<<"$out" && grep -qx "OnCalendar=daily" "$T/units/ai-sandbox-bake.timer"'
 out="$(run "$S" timer off 2>&1)"; rc=$?
 check_sh "...or removed" '[ $rc -ne 0 ] && grep -q "refusing to remove" <<<"$out" && [ -e "$T/units/ai-sandbox-bake.timer" ]'
+
+echo "== claude profile (#10)"
+fresh
+out="$(run "$S" agents)"
+check "agents lists claude with CT 1052" grep -q 'claude *CT 1052 *Claude Code' <<<"$out"
+out="$(run "$S" up claude 2>&1)"; rc=$?
+check "up claude without secrets exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+check "  ...and explains both credential kinds" bash -c 'grep -q "ANTHROPIC_API_KEY=" <<<"$1" && grep -q "claude setup-token" <<<"$1" && grep -q "CLAUDE_CODE_OAUTH_TOKEN=" <<<"$1"' _ "$out"
+check_sh "  ...own CT, hostname, native installer, verify" 'grep -q "^hostname: ai-sandbox-claude$" "$T/conf/1052.conf" && grep -q "curl -fsSL https://claude.ai/install.sh | bash" "$T/ct/1052/root/provision-base.sh" && [ "$(tail -n1 "$T/ct/1052/root/provision-base.sh")" = "claude --version" ]'
+check_sh "  ...and no Vibe in its build" '! grep -q "mistral.ai/vibe" "$T/ct/1052/root/provision-base.sh"'
+M="$T/ct/1052/etc/claude-code/managed-settings.json"
+check "managed settings injected" [ -f "$M" ]
+check "  ...mode 444" [ "$(stat -c %a "$M")" = 444 ]
+check_sh "  ...valid JSON with every default-deny key" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[\"permissions\"][\"disableBypassPermissionsMode\"]==\"disable\" and d[\"disableAutoMode\"]==\"disable\" and d[\"disableClaudeAiConnectors\"] is True and d[\"allowedMcpServers\"]==[] and d[\"enableAllProjectMcpServers\"] is False" "$M"'
+out="$(run AGENT_MCP=on FORCE=1 RESCUE=0 "$S" up claude 2>&1)"
+check_sh "AGENT_MCP=on drops only the MCP keys" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert \"allowedMcpServers\" not in d and \"enableAllProjectMcpServers\" not in d and d[\"disableClaudeAiConnectors\"] is True and \"permissions\" in d" "$M"'
+out="$(run AGENT_MCP=on AGENT_CONNECTORS=on AGENT_AUTO_APPROVE=on FORCE=1 RESCUE=0 "$S" up claude 2>&1)"
+check_sh "all three on: an empty (valid) policy" 'python3 -c "import json,sys; assert json.load(open(sys.argv[1]))=={}" "$M"'
+mkdir -p "$T/state/claude"; printf 'CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-test_not-real"\n' > "$T/state/claude/secrets.env"; chmod 600 "$T/state/claude/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up claude 2>&1)"; rc=$?
+U="$T/ct/1052/root/.claude/settings.json"
+check_sh "subscription token -> settings.json env block, mode 600" '[ $rc -eq 0 ] && [ "$(stat -c %a "$U")" = 600 ] && python3 -c "import json,sys; assert json.load(open(sys.argv[1]))=={\"env\":{\"CLAUDE_CODE_OAUTH_TOKEN\":\"sk-ant-oat01-test_not-real\"}}" "$U"'
+printf 'ANTHROPIC_API_KEY=sk-ant-api03-key\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-tok\n' > "$T/state/claude/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up claude 2>&1)"; rc=$?
+check_sh "both set: both passed, with a precedence warning, valid JSON" '[ $rc -eq 0 ] && grep -q "uses ANTHROPIC_API_KEY first" <<<"$out" && python3 -c "import json,sys; d=json.load(open(sys.argv[1]))[\"env\"]; assert d[\"ANTHROPIC_API_KEY\"]==\"sk-ant-api03-key\" and d[\"CLAUDE_CODE_OAUTH_TOKEN\"]==\"sk-ant-oat01-tok\"" "$U"'
+printf 'ANTHROPIC_API_KEY=sk-ant-api03-"x","y":"$(touch %s/pwned)\n' "$T" > "$T/state/claude/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up claude 2>&1)"; rc=$?
+check_sh "a value with JSON/shell metacharacters is refused, never executed" '[ $rc -ne 0 ] && grep -q "has characters a key or token never contains" <<<"$out" && [ ! -e "$T/pwned" ]'
+printf 'SOMETHING_ELSE=1\n' > "$T/state/claude/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up claude 2>&1)"; rc=$?
+check_sh "a secrets file without either key fails clearly" '[ $rc -ne 0 ] && grep -q "no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN line" <<<"$out"'
+out="$(run "$S" export claude 2>&1)"
+check "export suggests the Claude Code VS Code extension" grep -q 'anthropic.claude-code' <<<"$out"
+out="$(run "$S" status 2>&1)"
+check "status (all) lists claude" grep -qE '^claude +1052 +running' <<<"$out"
 
 echo
 echo "passed: $pass  failed: $fail"

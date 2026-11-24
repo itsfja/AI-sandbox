@@ -16,7 +16,7 @@ and that several agents can run side by side.
 | Agent | Profile | Status |
 | --- | --- | --- |
 | Mistral Vibe CLI | `mistral` | available |
-| Claude Code | `claude` | planned (PTF 3) |
+| Claude Code | `claude` | available |
 | Gemini CLI | `gemini` | planned (PTF 4) |
 | anything else | drop-in profile | planned (PTF 5) |
 
@@ -242,6 +242,34 @@ the Proxmox task status does not show (see
   credentials are in use, `/model` switches presets.
 - **VS Code extension**: `mistralai.mistral-vibe-code`; it reads the
   injected `/root/.vibe/.env`, so it comes up authenticated.
+
+### Claude Code (`claude`)
+
+CT 1052, hostname `ai-sandbox-claude`.
+
+- **Credential**, one line in `/root/.ai-sandbox/claude/secrets.env`:
+  - `ANTHROPIC_API_KEY=...`: a Claude Console API key (API billing). The
+    first interactive `claude` in each session asks once whether to use it.
+  - `CLAUDE_CODE_OAUTH_TOKEN=...`: your Pro, Max, Team or Enterprise
+    subscription. Create it with `claude setup-token` on any machine with
+    a browser; it is valid for a year and only makes model requests, so
+    claude.ai connectors and Remote Control are unavailable with it (they
+    are off in the sandbox anyway).
+
+  It is parsed, never executed, and written to the CT as the `env` block of
+  `/root/.claude/settings.json` (mode 600), which the CLI and the VS Code
+  extension both read. A value with characters no key or token contains is
+  refused. If both lines are present, Claude Code uses the API key.
+- **Policy**: `/etc/claude-code/managed-settings.json`, Claude Code's
+  managed settings, which nothing in the CT's user or project settings can
+  override. By default it disables bypass-permissions and auto mode
+  (`AGENT_AUTO_APPROVE`), claude.ai connectors (`AGENT_CONNECTORS`), and
+  every MCP server a user or project adds (`allowedMcpServers: []`,
+  `enableAllProjectMcpServers: false`; `AGENT_MCP`).
+- **Install**: the native installer (`claude` on `PATH`, no Node). Native
+  installs update themselves in the background, so a clone runs at least
+  the version the last bake installed.
+- **VS Code extension**: `anthropic.claude-code`.
 
 ### Writing a profile
 
@@ -934,7 +962,8 @@ Work is tracked as PTFs (fixes delivered as PRs):
    pve1, from ~1.5 min). Full rebuild stays available (`MODE=rebuild`).
    CLIs are as fresh as the last bake; `TOPUP=on` re-installs at spawn
    when you need the latest.
-3. **PTF 3 — Claude Code profile**, API key or subscription token.
+3. **PTF 3 — Claude Code profile** *(done)*: API key or subscription
+   token (`claude setup-token`), managed-settings policy.
 4. **PTF 4 — Gemini CLI profile.**
 5. **PTF 5 — drop-in profiles** for anything else, from
    `/root/.ai-sandbox/profiles/`.
