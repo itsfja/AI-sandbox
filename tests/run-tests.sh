@@ -53,6 +53,7 @@ fake='''profile_fake_meta() { PROFILE_CTID=1059; PROFILE_LABEL="Fake CLI"; PROFI
 profile_fake_install() { echo "echo installing fake"; }
 profile_fake_verify() { echo "fake --version"; }
 profile_fake_credentials() { ct_push_file "$SECRETS_FILE" /root/.fake/env 600; }
+profile_fake_credential_paths() { echo /root/.fake/env; }
 profile_fake_policy() { local t; t="$(mktemp)"; echo "mcp=$(bool_word "$AGENT_MCP")" > "$t"; ct_push_file "$t" /etc/fake/policy 444; rm -f "$t"; }
 
 '''
@@ -425,6 +426,79 @@ check_sh "the next bake replaces the half-built CT" '[ $rc -eq 0 ] && grep -q "^
 printf 'hostname: wordpress\ntags: web\n' > "$T/conf/1048.conf"
 out="$(B "$S" bake 2>&1)"; rc=$?
 check_sh "a foreign CT in a golden slot is never destroyed" '[ $rc -ne 0 ] && grep -q "refusing to touch CT 1048" <<<"$out" && grep -q wordpress "$T/conf/1048.conf"'
+
+echo "== spawn: sessions as linked clones of the golden (#9b)"
+fresh
+printf 'lvmthin: local-lvm\n\tthinpool data\n\tcontent rootdir,images\n' > "$T/storage.cfg"
+B() { run STORAGE_CFG="$T/storage.cfg" "$@"; }
+out="$(B "$S" up mistral 2>&1)"; rc=$?
+check_sh "no golden yet, MODE=auto: full rebuild with a note" '[ $rc -eq 0 ] && grep -q "MODE=auto: no golden template yet .* full rebuild instead" <<<"$out" && grep -q "^pct create 1051 " "$T/calls.log"'
+out="$(B "$S" status mistral 2>&1)"
+check "  ...status: built from a full rebuild" grep -q '^  built from: full rebuild$' <<<"$out"
+out="$(B MODE=clone FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"; rc=$?
+check_sh "no golden + MODE=clone refuses instead of rebuilding" '[ $rc -ne 0 ] && grep -q "MODE=clone: no golden template yet" <<<"$out"'
+out="$(B MODE=sideways "$S" up mistral 2>&1)"; rc=$?
+check_sh "invalid MODE rejected" '[ $rc -ne 0 ] && grep -q "invalid MODE=.sideways." <<<"$out"'
+B FORCE=1 RESCUE=0 "$S" down mistral >/dev/null 2>&1   # a full-build stub, parked before any bake
+out="$(B "$S" bake 2>&1)"; rc=$?
+check "bake exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+check_sh "  ...and moves the pristine full-build stub onto the golden" 'grep -q "refresh: re-parking the mistral stub (CT 1051) onto golden CT 1048" <<<"$out" && grep -q "^rootfs: local-lvm:base-1048-disk-0/vm-1051-disk-0" "$T/conf/1051.conf" && [ -e "$T/state/mistral/pristine-stub" ]'
+: > "$T/calls.log"
+out="$(B FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"; rc=$?
+check "up after a bake exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+check "  ...as a linked clone of the golden" grep -q '^pct clone 1048 1051 --hostname ai-sandbox-mistral --full 0$' "$T/calls.log"
+check "  ...not a full build" calls_lack '^pct create 1051 '
+# shellcheck disable=SC2034  # used inside check_sh strings, which ShellCheck cannot see
+C1="$T/conf/1051.conf"
+check_sh "  ...with this instance's settings: tag, hookscript, pinned MAC + firewall" 'grep -q "^tags: ai-sandbox$" "$C1" && grep -q "^hookscript: local:snippets/ai-sandbox-hook.sh$" "$C1" && grep -qE "^net0: .*hwaddr=$(cat "$T/state/mistral/mac"),firewall=1" "$C1"'
+check_sh "  ...and none of the golden's identity" '! grep -qE "^template:|golden" "$C1" && grep -q "^hostname: ai-sandbox-mistral$" "$C1"'
+check "  ...started after the settings were applied" bash -c "[ \$(grep -n '^pct set 1051 ' '$T/calls.log' | head -n1 | cut -d: -f1) -lt \$(grep -n '^pct start 1051' '$T/calls.log' | cut -d: -f1) ]"
+check "  ...skips the baseline/CLI provisioning (baked in)" calls_lack 'bash /root/provision-base.sh'
+check "  ...regenerates SSH host keys" grep -q "pct exec 1051 -- env -i .* bash -c ssh-keygen -A" "$T/calls.log"
+check_sh "  ...pushes root's authorized key" 'cmp -s "$T/state/ssh/ai-sandbox.pub" "$T/ct/1051/root/.ssh/authorized_keys"'
+check_sh "  ...injects the policy and marks it provisioned" '[ -f "$T/ct/1051/root/.vibe/config.toml" ] && [ "$(cat "$T/state/mistral/provisioned")" = 1051 ]'
+check "  ...prints the ssh line" grep -q 'sandbox ready.' <<<"$out"
+out="$(B "$S" status mistral 2>&1)"
+check "status: built from golden CT 1048 (current)" grep -q '^  built from: golden CT 1048 (current)$' <<<"$out"
+out="$(B DISK_GB=60 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "DISK_GB above the golden's size grows the clone" grep -q '^pct resize 1051 rootfs 60G$' "$T/calls.log"
+out="$(B DISK_GB=20 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "DISK_GB below it is noted, not attempted" grep -q 'cannot shrink, keeping 40G' <<<"$out"
+: > "$T/calls.log"
+out="$(B TOPUP=on FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check_sh "TOPUP=on re-runs only the agent installer on the clone" 'grep -q "TOPUP=on" <<<"$out" && grep -q "curl -LsSf https://mistral.ai/vibe/install.sh | bash" "$T/ct/1051/root/topup.sh" && ! grep -q "apt-get" "$T/ct/1051/root/topup.sh" && grep -q "bash /root/topup.sh" "$T/calls.log"'
+: > "$T/calls.log"
+out="$(B MODE=rebuild FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check_sh "MODE=rebuild still does the full build" 'grep -q "^pct create 1051 " "$T/calls.log" && calls_lack "^pct clone " && grep -q "bash /root/provision-base.sh" "$T/calls.log"'
+# GUI lifecycle on clones: down parks a clone stub; Start provisions it env-less
+B FORCE=1 RESCUE=0 "$S" up mistral >/dev/null 2>&1
+: > "$T/calls.log"
+out="$(B FORCE=1 RESCUE=0 "$S" down mistral 2>&1)"
+check_sh "down parks a never-started clone stub" 'grep -q "^pct clone 1048 1051 " "$T/calls.log" && calls_lack "^pct start 1051" && [ -e "$T/state/mistral/pristine-stub" ] && [ ! -e "$T/run/1051" ]'
+mkdir -p "$T/locked"; touch "$T/locked/1051"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check "GUI pre-start boots the clone stub" [ $rc -eq 0 ]
+rm -f "$T/locked/1051"; touch "$T/run/1051"; : > "$T/calls.log"
+out="$(env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "$(hookvars) $S hook 1051 post-start" 2>&1)"; rc=$?
+check_sh "GUI post-start (no shell env) does spawn provisioning" '[ $rc -eq 0 ] && grep -q "ready via GUI" <<<"$out" && grep -q "ssh-keygen -A" "$T/calls.log" && calls_lack "bash /root/provision-base.sh"'
+check "  ...with the managed key (hooks never run shared_setup)" cmp -s "$T/state/ssh/ai-sandbox.pub" "$T/ct/1051/root/.ssh/authorized_keys"
+# a second bake: the running clone stays on 1048, stubs move to 1049
+add_fake_profile
+B "$S" up fake >/dev/null 2>&1
+B FORCE=1 RESCUE=0 "$S" down fake >/dev/null 2>&1
+check "the fake agent is not in the golden: its stub is a full build" grep -q '^rootfs: local-lvm:' "$T/conf/1059.conf"
+out="$(B BAKE_AGENTS=mistral,fake "$S" bake 2>&1)"; rc=$?
+check_sh "second bake (both agents) goes to 1049" '[ $rc -eq 0 ] && [ "$(cat "$T/state/golden/current")" = 1049 ]'
+check_sh "  ...the running mistral clone is left on 1048" 'grep -q "base-1048-disk-0/vm-1051" "$T/conf/1051.conf" && [ -e "$T/run/1051" ]'
+check_sh "  ...the fake stub moves onto 1049" 'grep -q "base-1049-disk-0/vm-1059" "$T/conf/1059.conf" && [ -e "$T/state/fake/pristine-stub" ]'
+out="$(B "$S" status mistral 2>&1)"
+check "status flags the previous golden" grep -q 'built from: golden CT 1048 (previous; the next park or up moves it' <<<"$out"
+B FORCE=1 RESCUE=0 "$S" up mistral >/dev/null 2>&1
+check "the next up moves mistral to the current golden" grep -q 'base-1049-disk-0/vm-1051' "$T/conf/1051.conf"
+out="$(B "$S" bake 2>&1)"; rc=$?
+check_sh "so the third bake can reuse slot 1048" '[ $rc -eq 0 ] && [ "$(cat "$T/state/golden/current")" = 1048 ]'
 
 echo
 echo "passed: $pass  failed: $fail"

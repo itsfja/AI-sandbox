@@ -16,7 +16,9 @@
 #   ip      <agent>  current IP (empty if not running)
 #   export  <agent>  desktop bundle: keypair + ssh-config (after 'up')
 #   agents           list the agent profiles this script knows
-#   bake             build a golden template (every agent CLI) in a free slot
+#   bake             build a golden template (every agent CLI) in a free slot;
+#                    sessions then start as linked clones of it (MODE)
+#   refresh-stub     INTERNAL — re-park a pristine stub onto the new golden
 #   update           self-update from main (previous copy kept as .bak)
 #   hook             INTERNAL — called by the PVE hookscript shim (vmid, phase)
 #   park-deferred    INTERNAL — run by systemd after a GUI Stop (agent, vmid)
@@ -162,6 +164,8 @@ apply_defaults() {
   EGRESS_POLICY="${EGRESS_POLICY:-lan-block}"     # lan-block | strict | off
   EGRESS_ALLOW="${EGRESS_ALLOW:-}"     # optional comma-separated IPs/CIDRs allowed outbound
   EGRESS_DENY="${EGRESS_DENY:-}"       # extra CIDRs lan-block drops: your site's PUBLIC IPv6 range(s)
+  MODE="${MODE:-auto}"                 # auto | clone | rebuild - how sessions are built (see spawn_mode)
+  TOPUP="${TOPUP:-off}"                # on = re-run the agent's CLI installer on a clone at spawn
   PROVISION_HOOKS=("$(dirname "$(readlink -f "$0")")/provision.sh" "${INSTANCE_DIR}/provision.sh")
   [[ "$CTID" =~ ^[0-9]+$ ]] && [ "$CTID" -ge 100 ] || die "invalid CTID '$CTID'"
 }
@@ -906,13 +910,18 @@ print_hardening_summary() {
 # When firewall_active, the host-side PVE ruleset is written BEFORE pct create
 # and net0 carries firewall=1 so there is no unfiltered boot window.
 create_sandbox() {
-  local hookargs=() startargs=() net0_opts
+  local hookargs=() startargs=() net0_opts golden
   validate_hardening_config
   ensure_mac
   configure_firewall
   net0_opts="name=eth0,bridge=${BRIDGE},ip=dhcp${CT_MAC:+,hwaddr=$CT_MAC}"
   firewall_active && net0_opts="${net0_opts},firewall=1"
   [ "$HOOK" = "on" ] && hookargs=(--hookscript "$HOOK_VOL_ID")
+  golden="$(spawn_mode)"
+  if [ -n "$golden" ]; then
+    clone_sandbox "$golden" "${1:-start}" "$net0_opts" "${hookargs[@]}"
+    return 0
+  fi
   [ "${1:-start}" = "start" ] && startargs=(--start 1)
   pct create "$CTID" "$TEMPLATE" \
     --hostname "$CTHOST" \
@@ -926,6 +935,114 @@ create_sandbox() {
     --onboot 0 \
     "${hookargs[@]}" \
     "${startargs[@]}"
+}
+
+# --------------------------- spawn from the golden (#9, part 2) ----------------
+# MODE decides how a session is built:
+#   auto     linked clone of the current golden when one exists and has this
+#            agent baked in; otherwise a full rebuild (with a note)
+#   clone    linked clone, or refuse (no silent minutes-long rebuild)
+#   rebuild  always the full build from the Debian template (pre-bake path)
+# A clone inherits the golden's baseline and CLIs; spawn provisioning only
+# gives it what is per-session: fresh SSH host keys, root's authorized key,
+# the credential, the policy, user hooks (and the CLI again with TOPUP=on).
+# Which provisioning runs is decided by what the CT IS (its rootfs is a
+# linked clone or not), so the GUI post-start hook, which has no shell
+# environment, always matches how the CT was built.
+
+validate_spawn_config() {
+  case "$MODE" in auto|clone|rebuild) ;; *) die "invalid MODE='$MODE' (expected 'auto', 'clone' or 'rebuild')" ;; esac
+  validate_on_off TOPUP "$TOPUP"
+}
+
+golden_usable() {   # $1 = golden CTID; rc 0 when it is a template with $AGENT baked in
+  local cfg agents
+  cfg="$(pct config "$1" 2>/dev/null)" || return 1
+  grep -q '^hostname: ai-sandbox-golden$' <<<"$cfg" && grep -q '^template: 1$' <<<"$cfg" || return 1
+  agents="$(sed -n 's/.* agents=\([^ ]*\).*/\1/p' "${STATE_DIR}/golden/stamp" 2>/dev/null | head -n1)"
+  [[ ",${agents}," == *",${AGENT},"* ]]
+}
+
+spawn_mode() {   # echoes the golden CTID to clone from; empty = full rebuild
+  validate_spawn_config
+  [ "$MODE" = rebuild ] && return 0
+  local golden
+  golden="$(golden_current)"
+  if [ -n "$golden" ] && golden_usable "$golden"; then
+    echo "$golden"
+    return 0
+  fi
+  local why="no golden template yet (run '$0 bake')"
+  [ -n "$golden" ] && why="golden CT $golden is missing, not a template, or was baked without $AGENT (run '$0 bake')"
+  [ "$MODE" = clone ] && die "MODE=clone: $why; or set MODE=rebuild"
+  echo "MODE=auto: $why - full rebuild instead" >&2
+}
+
+# Linked clone of the golden, then this instance's own settings on top.
+clone_sandbox() {   # $1 = golden CTID, $2 = start|stopped, $3 = net0, "${@:4}" = hookscript args
+  local golden="$1" mode="$2" net0="$3" size
+  shift 3
+  echo "cloning CT $CTID from golden CT $golden (linked clone) ..."
+  pct clone "$golden" "$CTID" --hostname "$CTHOST" --full 0
+  pct set "$CTID" \
+    --cores "$CORES" --memory "$RAM_MB" --swap "$SWAP_MB" \
+    --net0 "$net0" \
+    --tags "$SANDBOX_TAG" \
+    --onboot 0 \
+    "$@"
+  # the clone has the golden's disk size; grow it if this agent wants more
+  size="$(pct config "$CTID" | sed -n 's/^rootfs: .*size=\([0-9]*\)G.*/\1/p')"
+  if [ -n "$size" ] && [ "$DISK_GB" -gt "$size" ]; then
+    pct resize "$CTID" rootfs "${DISK_GB}G"
+  elif [ -n "$size" ] && [ "$DISK_GB" -lt "$size" ]; then
+    echo "note: DISK_GB=$DISK_GB is below the golden's ${size}G; a clone cannot shrink, keeping ${size}G" >&2
+  fi
+  [ "$mode" = start ] && pct start "$CTID"
+  return 0
+}
+
+ct_golden_base() {   # echoes the golden CTID this CT is a linked clone of, if any
+  pct config "$CTID" 2>/dev/null | sed -n 's/^rootfs: [^ ]*base-\([0-9]*\)-disk-.*/\1/p' | head -n1
+}
+
+# Per-session provisioning of a clone (everything else is baked in).
+spawn_provision() {
+  echo "spawn: fresh SSH host keys, authorized key, credential and policy for $PROFILE_LABEL ..."
+  ct_run bash -c 'ssh-keygen -A >/dev/null && (systemctl restart ssh >/dev/null 2>&1 || true)'
+  # hooks never run shared_setup, so fall back to the managed key's .pub
+  local pub="${SSH_PUBKEY:-${SSH_KEY_FILE}.pub}"
+  [ -f "$pub" ] || die "spawn: no SSH public key at $pub (run '$0 up $AGENT' once to generate the keypair)"
+  ct_push_file "$pub" /root/.ssh/authorized_keys 600
+  if [ "$TOPUP" = on ]; then
+    echo "spawn: TOPUP=on - re-running the $PROFILE_LABEL installer for the latest release ..."
+    local t
+    t="$(mktemp)"
+    {
+      printf '#!/usr/bin/env bash\nset -euo pipefail\nexport LC_ALL=C PATH="/root/.local/bin:$PATH"\n'
+      "profile_${AGENT}_install"
+      "profile_${AGENT}_verify"
+    } > "$t"
+    ct_push_file "$t" /root/topup.sh 700
+    rm -f "$t"
+    ct_run bash /root/topup.sh
+  fi
+}
+
+# INTERNAL (run by `bake`): a pristine stub still on an older golden, or on
+# a full build, is re-parked onto the new golden: a stub holds nothing, and
+# moving it frees the old golden slot for the next bake.
+cmd_refresh_stub() {
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || { echo "refresh: $AGENT is busy - its stub moves at its next park"; return 0; }
+  stub_is_pristine || return 0
+  local cur base
+  cur="$(golden_current)"
+  base="$(ct_golden_base)"
+  [ -n "$cur" ] && [ "$base" != "$cur" ] || return 0
+  golden_usable "$cur" || return 0
+  validate_hardening_config
+  echo "refresh: re-parking the $AGENT stub (CT $CTID) onto golden CT $cur ..."
+  park_sandbox
 }
 
 # Wipe the rootfs of the STOPPED CT (keep the disk object, destroy the data).
@@ -1140,13 +1257,18 @@ inject_credentials() {
 # policy + optional user hooks (script dir, then the instance dir).
 provision_and_report() {
   clear_provisioned
-  echo "provisioning base toolchain and $PROFILE_LABEL ..."
   local prov hook
-  prov="$(mktemp)"
-  provision_script > "$prov"
-  ct_push_file "$prov" /root/provision-base.sh 700
-  ct_run bash /root/provision-base.sh
-  rm -f "$prov"
+  if [ -n "$(ct_golden_base)" ]; then
+    validate_spawn_config
+    spawn_provision
+  else
+    echo "provisioning base toolchain and $PROFILE_LABEL ..."
+    prov="$(mktemp)"
+    provision_script > "$prov"
+    ct_push_file "$prov" /root/provision-base.sh 700
+    ct_run bash /root/provision-base.sh
+    rm -f "$prov"
+  fi
 
   # permanent credential store -> fresh CT, every build
   inject_credentials
@@ -1383,6 +1505,10 @@ cmd_bake() {
   echo "golden template ready: CT $CTID"
   sed 's/^/  /' <<<"$stamp"
   [ -n "$prev" ] && echo "previous golden CT $prev is kept while sandboxes still run from it; the next bake reuses its slot"
+  # parked, never-booted stubs hold nothing: move them onto the new golden
+  for a in $(list_profiles); do
+    "$(readlink -f "$0")" refresh-stub "$a" || echo "warning: could not refresh the $a stub; it moves at its next park" >&2
+  done
   return 0
 }
 
@@ -1720,6 +1846,13 @@ cmd_status() {
       echo "$AGENT: CT $CTID stopped: NOT a fresh stub (GUI Start will refuse; run '$0 up $AGENT'), firewall: ${fw_info}"
     fi
   fi
+  local base
+  base="$(ct_golden_base)"
+  if [ -n "$base" ]; then
+    echo "  built from: golden CT $base$([ "$base" = "$(golden_current)" ] && echo " (current)" || echo " (previous; the next park or up moves it to the current golden)")"
+  else
+    echo "  built from: full rebuild"
+  fi
 }
 
 # Every ai-sandbox CT on this node, whichever agent and CTID.
@@ -1800,6 +1933,7 @@ case "$cmd" in
     else select_agent ""; fi ;;
   status) [ -z "${1:-${AGENT:-}}" ] || select_agent "${1:-}" ;;
   bake)   select_golden ;;
+  refresh-stub) select_agent "${1:-}" ;;
   park-deferred)   # <agent> <vmid>: the vmid wins over config, as in hooks
     [[ "${2:-}" =~ ^[0-9]+$ ]] || die "park-deferred: usage: $0 park-deferred <agent> <vmid>"
     CTID="$2"; select_agent "${1:-}" ;;
@@ -1819,6 +1953,7 @@ case "$cmd" in
   hook)   cmd_hook "$@" ;;
   park-deferred) cmd_park_deferred ;;
   bake)   cmd_bake ;;
+  refresh-stub) cmd_refresh_stub ;;
   *) awk 'NR == 1 || /^# ====/ {next} /^set -/ {exit} /^#/ {sub(/^# ?/, ""); print}' "$0"; exit 1 ;;
 esac
 

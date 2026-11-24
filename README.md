@@ -327,11 +327,10 @@ Settings (all optional):
 | `STATE_DIR` | `/root/.ai-sandbox` | host state root (environment only) |
 | `GOLDEN_CTIDS` | `1048,1049` | the two CT IDs `bake` alternates between (global config only) |
 | `BAKE_AGENTS` | `all` | comma-separated agents whose CLIs `bake` installs (global config only) |
+| `MODE` | `auto` | how sessions are built: `auto` (linked clone of the golden when it has this agent, else full rebuild), `clone` (clone or refuse), `rebuild` (always the full build) |
+| `TOPUP` | `off` | `on` = re-run the agent's CLI installer on a clone at spawn, for the latest release |
 
 ## Golden template (bake)
-
-*Part 1 of PTF 2 (#9): sessions do not use the template yet; spawning
-them as linked clones comes next.*
 
 `bake` does the expensive build once: a CT from the Debian template, the
 baseline toolchain, and every agent's CLI (`BAKE_AGENTS`). It then strips
@@ -359,6 +358,29 @@ The template needs rootfs storage that supports linked clones: `lvmthin`
 (like `local-lvm`), `zfspool` or `rbd`. Its hostname is
 `ai-sandbox-golden`, so `golden` cannot be an agent name; it carries no
 hookscript, and the GUI hook ignores it.
+
+### Sessions as linked clones
+
+Once a golden exists, every session is a **linked clone** of it: `up`,
+`down`/GUI Stop (the parked stub) and `reset` clone instead of building,
+so a fresh sandbox takes seconds and every session from one bake starts
+from the same image. Per session, only what must be unique is added:
+fresh SSH host keys, root's authorized key, the agent's credential and
+policy, and your [provisioning hooks](#provisioning-hooks). The clone
+gets this instance's own CPU/RAM, pinned MAC, firewall, tag and
+hookscript; `DISK_GB` can grow the golden's disk size but not shrink it.
+
+- `MODE=auto` (default) clones when the current golden has the agent baked
+  in and falls back to a full rebuild, with a note, when it does not
+  (no bake yet, or a new agent since the last bake). `MODE=clone` refuses
+  instead of falling back; `MODE=rebuild` always builds from scratch.
+- CLIs are as fresh as the last bake. `TOPUP=on` re-runs the agent's
+  installer at spawn when you need today's release.
+- After a bake, parked never-started stubs are moved onto the new golden
+  right away. Running sandboxes stay on the golden they were cloned from
+  until their next park or `up`; `status <agent>` shows which
+  (`built from: golden CT 1048 (current)`).
+- A linked clone lives on the golden's storage, whatever `STORAGE` says.
 
 ## From your desktop (export)
 
@@ -885,11 +907,11 @@ Work is tracked as PTFs (fixes delivered as PRs):
    can run in parallel; host state and config files under
    `/root/.ai-sandbox`.
 2. **PTF 2 — bake and spawn**: build a golden template once (`bake`,
-   weekly on a timer, with a check that no credential ever lands in it;
-   `bake` itself is in), then start each session as a linked clone in seconds. Full rebuild
-   stays available as a fallback mode. CLIs are as fresh as the last bake;
-   an opt-in top-up at spawn (`TOPUP=on`) will cover the times you need the
-   latest.
+   with a check that no credential ever lands in it), then start each
+   session as a linked clone in seconds (both in; the weekly timer is
+   next). Full rebuild stays available (`MODE=rebuild`). CLIs are as
+   fresh as the last bake; `TOPUP=on` re-installs at spawn when you need
+   the latest.
 3. **PTF 3 — Claude Code profile**, API key or subscription token.
 4. **PTF 4 — Gemini CLI profile.**
 5. **PTF 5 — drop-in profiles** for anything else, from

@@ -9,7 +9,7 @@ cmd="$1"; shift
 # hookscript pre-start included. Tests simulate that by touching
 # $T/locked/<id>: commands that need the lock then time out like PVE does.
 case "$cmd" in
-  create|destroy|set|start|stop|push|template)
+  create|destroy|set|start|stop|push|template|clone|resize)
     if [ -e "$T/locked/${1:-}" ]; then
       echo "trying to acquire lock..." >&2
       echo "can't lock file '/run/lock/lxc/pve-config-$1.lock' - got timeout" >&2
@@ -54,7 +54,27 @@ case "$cmd" in
   start) touch "$T/run/$1" ;;
   stop)  rm -f "$T/run/$1" ;;
   destroy) rm -f "$T/conf/$1.conf" "$T/run/$1"; rm -rf "$T/ct/$1" ;;
-  set) echo "set $*" >> "$T/calls.log" ;;
+  set)   # apply --key value pairs to the config, like PVE
+    echo "set $*" >> "$T/calls.log"
+    id="$1"; shift; [ -e "$T/conf/$id.conf" ] || exit 2
+    while [ $# -gt 1 ]; do
+      k="${1#--}"; v="$2"; shift 2
+      grep -v "^$k: " "$T/conf/$id.conf" > "$T/conf/$id.conf.tmp" || true
+      echo "$k: $v" >> "$T/conf/$id.conf.tmp"; mv "$T/conf/$id.conf.tmp" "$T/conf/$id.conf"
+    done ;;
+  clone)  # linked clone of a template: config minus template/hostname, base-<src> rootfs
+    src="$1"; id="$2"; shift 2
+    [ -e "$T/conf/$src.conf" ] || { echo "CT $src does not exist" >&2; exit 2; }
+    [ -e "$T/conf/$id.conf" ] && { echo "CT $id already exists" >&2; exit 2; }
+    grep -q '^template: 1$' "$T/conf/$src.conf" || { echo "CT $src is not a template" >&2; exit 2; }
+    host=""
+    while [ $# -gt 0 ]; do case "$1" in --hostname) host="$2" ;; esac; shift 2; done
+    size="$(sed -n 's/^rootfs: .*size=\([0-9]*G\).*/\1/p' "$T/conf/$src.conf")"
+    grep -vE '^(template|hostname|rootfs): ' "$T/conf/$src.conf" > "$T/conf/$id.conf" || true
+    echo "hostname: ${host:-CT$id}" >> "$T/conf/$id.conf"
+    echo "rootfs: local-lvm:base-$src-disk-0/vm-$id-disk-0,size=${size:-40G}" >> "$T/conf/$id.conf"
+    rm -rf "$T/ct/$id"; cp -a "$T/ct/$src" "$T/ct/$id" 2>/dev/null || mkdir -p "$T/ct/$id" ;;
+  resize) echo "resize $*" >> "$T/calls.log" ;;
   enter) echo "(would enter CT $1)" ;;
   template)
     id="$1"; [ -e "$T/conf/$id.conf" ] || exit 2
