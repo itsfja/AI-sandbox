@@ -219,9 +219,16 @@ generation, the template download, and writing the hook shim.
 
 ```text
 # /root/ai-sandbox.sh status
-AGENT      CTID   STATE    IP
-mistral    1051   running  192.168.3.77
+AGENT      CTID   STATE    IP              PROVISIONED
+mistral    1051   running  192.168.3.77    yes
 ```
+
+`PROVISIONED` (and `running, provisioned` in `status <agent>`) means the
+last build finished every provisioning step; the mark lives in
+`/root/.ai-sandbox/<agent>/provisioned` and is cleared by every rebuild,
+park, and destroy. `NO` on a running CT means provisioning failed, which
+the Proxmox task status does not show (see
+[Troubleshooting](#troubleshooting)).
 
 ### Mistral (`mistral`)
 
@@ -647,7 +654,7 @@ References: [Vibe Work Connectors](https://docs.mistral.ai/vibe/work/connectors)
 | `down <agent>` | clobber the disk and park a fresh stopped stub (GUI Start-able) |
 | `purge <agent>` | destroy completely — no stub, gone from the tree |
 | `reset <agent>` | `down` then `up` — fresh rebuild mid-work |
-| `status [agent]` | one agent's CTID, state, IP and firewall; every ai-sandbox CT when no agent is given |
+| `status [agent]` | one agent's CTID, state, provisioned or not, IP and firewall; every ai-sandbox CT when no agent is given |
 | `ip <agent>` | the current IP (empty if not running) |
 | `ssh <agent> [command]` | ssh in with the managed key (or run one command) |
 | `shell <agent>` | root shell inside the CT (`pct enter`) |
@@ -737,11 +744,14 @@ PVE hookscript.)
 - `ssh ai-sandbox-<agent>` connects to nothing after a rebuild — the IP
   went stale (DHCP). Re-run `export`, use `vscode-connect`, or set a DHCP
   reservation for the agent's MAC.
-- GUI Start finishes but no ssh line in the task log — the post-start
-  hook found no IP or provisioning failed; read the task log above it.
-  Proxmox marks the Start task `OK` even when post-start fails, so the
-  `mistral sandbox ready via GUI` line (not the green tick) is the proof.
-  `vibe: command not found` inside the sandbox is the same symptom.
+- GUI Start shows `OK` but the sandbox is not usable (no ssh line,
+  `vibe: command not found` inside) — post-start found no IP or
+  provisioning failed, and Proxmox marks the Start task `OK` whatever the
+  hook's exit code. The task log then ends with `post-start: provisioning
+  FAILED (exit N)`, after the real error; `status <agent>` says `running,
+  NOT provisioned`. Fix the cause, then run `/root/ai-sandbox.sh up
+  <agent>`. The `<agent> sandbox ready via GUI` line, or `running,
+  provisioned`, is the proof it worked, not the green tick.
 - GUI Start fails with `pre-start: CT <id> is not a fresh stub` — the CT
   has booted since it was built (for example the host went down while
   the sandbox was running) and was never parked. Run

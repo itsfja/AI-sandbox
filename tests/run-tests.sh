@@ -326,6 +326,43 @@ check_sh "invalid EGRESS_DENY entry rejected (no .fw injection)" '[ $rc -ne 0 ] 
 out="$(run MOCK_IPV6="$V6" EGRESS_POLICY=strict FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
 check "strict policy (drops everything) -> no IPv6 warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
 
+echo "== provisioned marker: failed provisioning is visible (#15)"
+fresh
+out="$(run "$S" up mistral 2>&1)"
+check "after a good up: provisioned marker for CT 1051" [ "$(cat "$T/state/mistral/provisioned" 2>/dev/null)" = 1051 ]
+check_sh "  ...and no failure line" '! grep -q "provisioning FAILED" <<<"$out"'
+out="$(run "$S" status mistral 2>&1)"
+check "status: running, provisioned" grep -q '^mistral: CT 1051 running, provisioned, ip: 192.168.3.77' <<<"$out"
+out="$(run "$S" status 2>&1)"
+check "status (all): PROVISIONED yes" grep -qE '^mistral +1051 +running +192\.168\.3\.77 +yes$' <<<"$out"
+rm -f "$T/state/mistral/provisioned"
+( exec 9>/run/lock/ai-sandbox.mistral.lock; flock -n 9; sleep 3 ) &
+holder=$!; sleep 0.5
+out="$(run "$S" status mistral 2>&1)"
+check "no marker while the agent's lock is held: provisioning in progress" grep -q 'running, provisioning in progress' <<<"$out"
+wait "$holder"
+run "$S" up mistral >/dev/null 2>&1
+run FORCE=1 RESCUE=0 "$S" down mistral >/dev/null 2>&1
+check "down clears the marker" [ ! -e "$T/state/mistral/provisioned" ]
+# GUI Start whose post-start provisioning fails: PVE still says TASK OK
+mkdir -p "$T/locked"; touch "$T/locked/1051"
+gui_hook 1051 pre-start >/dev/null
+rm -f "$T/locked/1051"; touch "$T/run/1051"
+out="$(env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" MOCK_PROVISION_FAIL=1 bash -c "$(hookvars) $S hook 1051 post-start" 2>&1)"; rc=$?
+check_sh "GUI post-start with failing provisioning ends on a FAILED line" '[ $rc -ne 0 ] && tail -n1 <<<"$out" | grep -q "^post-start: provisioning FAILED (exit 127) - the mistral sandbox is NOT ready"'
+check_sh "  ...after the real error, not instead of it" 'grep -q "vibe: command not found" <<<"$out"'
+check_sh "  ...and never claims ready" '! grep -q "ready via GUI" <<<"$out"'
+check "  ...no marker" [ ! -e "$T/state/mistral/provisioned" ]
+out="$(run "$S" status mistral 2>&1)"
+check "  ...status: running, NOT provisioned, pointing at up" grep -q "running, NOT provisioned (see the Start task log, or run '.* up mistral')" <<<"$out"
+out="$(run "$S" status 2>&1)"
+check "  ...status (all): PROVISIONED NO" grep -qE '^mistral +1051 +running +192\.168\.3\.77 +NO$' <<<"$out"
+out="$(run MOCK_PROVISION_FAIL=1 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"; rc=$?
+check_sh "CLI up with failing provisioning exits non-zero, FAILED line last" '[ $rc -ne 0 ] && tail -n1 <<<"$out" | grep -q "^up: provisioning FAILED (exit 127)"'
+check "  ...no marker" [ ! -e "$T/state/mistral/provisioned" ]
+out="$(run FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"; rc=$?
+check_sh "a good up afterwards: provisioned again, no FAILED line" '[ $rc -eq 0 ] && [ "$(cat "$T/state/mistral/provisioned")" = 1051 ] && ! grep -q "provisioning FAILED" <<<"$out"'
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]
