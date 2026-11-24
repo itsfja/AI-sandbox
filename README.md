@@ -245,7 +245,7 @@ the Proxmox task status does not show (see
 
 ### Writing a profile
 
-Until drop-in profiles land (PTF 5), a new agent is five functions in
+Until drop-in profiles land (PTF 5), a new agent is six functions in
 `ai-sandbox.sh`, named `profile_<agent>_<part>`:
 
 | Part | Job |
@@ -255,6 +255,7 @@ Until drop-in profiles land (PTF 5), a new agent is five functions in
 | `verify` | print the command that proves the CLI works, e.g. `foo --version` |
 | `credentials` | push `$SECRETS_FILE` into the CT in the agent's native form (use `ct_push_file <src> <dest> <mode>`) |
 | `policy` | write the default-deny config from `AGENT_CONNECTORS`, `AGENT_MCP`, `AGENT_AUTO_APPROVE` (use `bool_word on\|off` → `true\|false`) |
+| `credential_paths` | print the in-CT path(s) `credentials` writes, one per line; `bake` refuses to template an image where any of them exists |
 | `credentials_hint` | *optional*: tell the user how to create `secrets.env` when it is missing |
 
 The Mistral profile near the top of the script is the reference.
@@ -324,6 +325,40 @@ Settings (all optional):
 | `EGRESS_DENY` | — | extra CIDRs `lan-block` drops — set it to your site's public IPv6 prefix (e.g. your /48) |
 | `FW_DIR` | `/etc/pve/firewall` | Proxmox firewall config directory |
 | `STATE_DIR` | `/root/.ai-sandbox` | host state root (environment only) |
+| `GOLDEN_CTIDS` | `1048,1049` | the two CT IDs `bake` alternates between (global config only) |
+| `BAKE_AGENTS` | `all` | comma-separated agents whose CLIs `bake` installs (global config only) |
+
+## Golden template (bake)
+
+*Part 1 of PTF 2 (#9): sessions do not use the template yet; spawning
+them as linked clones comes next.*
+
+`bake` does the expensive build once: a CT from the Debian template, the
+baseline toolchain, and every agent's CLI (`BAKE_AGENTS`). It then strips
+what no session may inherit (SSH host keys, machine-id, root's
+`authorized_keys`, the provisioning script, caches), **refuses** if any
+profile's credential path exists in the image, stamps it
+(`/etc/ai-sandbox-golden`: date, agents, CLI versions), and turns it into
+a Proxmox template:
+
+```bash
+/root/ai-sandbox.sh bake
+/root/ai-sandbox.sh status      # ... golden: CT 1048 template (current), baked=...
+```
+
+Two slots, `GOLDEN_CTIDS` (default `1048,1049`), are used alternately.
+Proxmox cannot destroy a template while linked clones still use its base
+disk, so a bake never touches the current golden: it builds into the
+other slot, replacing the old template there only when no CT's rootfs
+still references it. If sandboxes still run from it, the bake stops and
+names them; rebuild them (`up`, or GUI Stop) and bake again. A failed bake
+leaves the current golden as it was, and the half-built CT stopped in the
+other slot for inspection (`status` flags it; the next bake replaces it).
+
+The template needs rootfs storage that supports linked clones: `lvmthin`
+(like `local-lvm`), `zfspool` or `rbd`. Its hostname is
+`ai-sandbox-golden`, so `golden` cannot be an agent name; it carries no
+hookscript, and the GUI hook ignores it.
 
 ## From your desktop (export)
 
@@ -660,6 +695,7 @@ References: [Vibe Work Connectors](https://docs.mistral.ai/vibe/work/connectors)
 | `shell <agent>` | root shell inside the CT (`pct enter`) |
 | `export <agent>` | desktop bundle (keypair copy + ssh-config + per-OS instructions) |
 | `agents` | list the agent profiles and their default CTIDs |
+| `bake` | build a golden template with every agent's CLI in the free slot (see [Golden template](#golden-template-bake)) |
 | `update` | self-update the script from `main` (previous copy kept beside it) |
 | `hook` | internal — called by the PVE hookscript shim with (vmid, phase) |
 
@@ -849,8 +885,8 @@ Work is tracked as PTFs (fixes delivered as PRs):
    can run in parallel; host state and config files under
    `/root/.ai-sandbox`.
 2. **PTF 2 — bake and spawn**: build a golden template once (`bake`,
-   weekly on a timer, with a check that no credential ever lands in it),
-   then start each session as a linked clone in seconds. Full rebuild
+   weekly on a timer, with a check that no credential ever lands in it;
+   `bake` itself is in), then start each session as a linked clone in seconds. Full rebuild
    stays available as a fallback mode. CLIs are as fresh as the last bake;
    an opt-in top-up at spawn (`TOPUP=on`) will cover the times you need the
    latest.

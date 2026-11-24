@@ -16,6 +16,7 @@
 #   ip      <agent>  current IP (empty if not running)
 #   export  <agent>  desktop bundle: keypair + ssh-config (after 'up')
 #   agents           list the agent profiles this script knows
+#   bake             build a golden template (every agent CLI) in a free slot
 #   update           self-update from main (previous copy kept as .bak)
 #   hook             INTERNAL — called by the PVE hookscript shim (vmid, phase)
 #   park-deferred    INTERNAL — run by systemd after a GUI Stop (agent, vmid)
@@ -32,6 +33,8 @@
 #   <agent>/mac              retained MAC (generated on first build)
 #   <agent>/pristine-stub    "the stopped CT has never booted" (GUI Start gate)
 #   <agent>/provisioned      "the running CT finished provisioning" (status)
+#   golden/current           CTID of the current golden template (after `bake`)
+#   golden/stamp             when it was baked, for which agents, CLI versions
 # config.env files hold plain KEY=value lines (never executed). Precedence:
 # command-line env > <agent>/config.env > config.env > built-in default.
 # Put lasting overrides there: GUI Start/Stop hooks run WITHOUT your shell
@@ -92,7 +95,8 @@ load_config_file() {   # $1 = path
 }
 
 valid_agent_name() { [[ "${1:-}" =~ ^[a-z][a-z0-9]{0,15}$ ]]; }
-profile_exists()   { valid_agent_name "$1" && declare -F "profile_${1}_meta" >/dev/null; }
+# "golden" is reserved: the baked template is CT hostname ai-sandbox-golden
+profile_exists()   { valid_agent_name "$1" && [ "$1" != golden ] && declare -F "profile_${1}_meta" >/dev/null; }
 
 # Resolve AGENT, load its profile metadata and config files, then derive the
 # instance defaults. Called once per run, before any instance operation.
@@ -171,6 +175,8 @@ apply_defaults() {
 #   credentials   push $SECRETS_FILE into the CT in the agent's native form
 #   policy        inject the default-deny config from AGENT_CONNECTORS,
 #                 AGENT_MCP and AGENT_AUTO_APPROVE (only when AGENT_HARDEN=on)
+#   credential_paths   print the in-CT paths the credential lands at, one per
+#                 line; `bake` fails if any of them exists in the golden image
 #   credentials_hint   (optional) how to create $SECRETS_FILE, shown when absent
 # Helpers for profiles: ct_push_file <src> <dest> <mode>, bool_word on|off.
 
@@ -200,6 +206,8 @@ profile_mistral_credentials() {
   ct_push_file "$SECRETS_FILE" /root/.vibe/.env 600
   echo "credentials injected (host: $SECRETS_FILE -> CT: /root/.vibe/.env)"
 }
+
+profile_mistral_credential_paths() { echo /root/.vibe/.env; }
 
 profile_mistral_credentials_hint() {
   echo "  create a Vibe key at chat.mistral.ai (Code > Vibe CLI), then run:"
@@ -1074,7 +1082,9 @@ stub_firewall_consistent() {
 # agent-neutral baseline, then the profile's install snippet (current CLI
 # release at build time — no pinning, by design), then its verify command.
 # Anything beyond this, the agent installs itself at runtime.
-provision_script() {
+provision_script() {   # "$@" = agents to install (default: $AGENT)
+  local a agents=("$@")
+  [ "${#agents[@]}" -gt 0 ] || agents=("$AGENT")
   cat <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1101,13 +1111,15 @@ apt-get install -y -qq --no-install-recommends -o Dpkg::Use-Pty=0 \
 mkdir -p /etc/ssh/sshd_config.d
 printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/10-ai-sandbox-root-key-only.conf
 sshd -t && systemctl reload ssh >/dev/null 2>&1 || true
-
-# ---- agent profile: install ----
 EOF
-  "profile_${AGENT}_install"
-  echo
-  echo "# ---- agent profile: verify ----"
-  "profile_${AGENT}_verify"
+  for a in "${agents[@]}"; do
+    echo
+    echo "# ---- agent profile: $a install ----"
+    "profile_${a}_install"
+    echo
+    echo "# ---- agent profile: $a verify ----"
+    "profile_${a}_verify"
+  done
 }
 
 # Re-inject the agent's permanent credential store into the fresh CT, in
@@ -1171,6 +1183,225 @@ print_ssh_line() {
 purge_known_hosts() {   # $1 = sandbox IP
   [ -n "${1:-}" ] || return 0
   ssh-keygen -R "$1" >/dev/null 2>&1 || true
+}
+
+# --------------------------- golden template (bake) --------------------------
+# #9: do the expensive build once (`bake`, weekly), then start sessions as
+# linked clones of the result. `bake` builds a CT from the Debian template
+# with the baseline and EVERY agent's CLI (BAKE_AGENTS), strips what must
+# never be shared between sessions (SSH host keys, machine-id, root's
+# authorized_keys, the provisioning script, caches), refuses if any
+# profile's credential path exists in the image, then `pct template`s it.
+#
+# Two slots (GOLDEN_CTIDS, default 1048,1049), used alternately: Proxmox
+# cannot destroy a template while linked clones still use its base disk,
+# so a bake never touches the CURRENT golden. It builds into the other
+# slot, destroying the old template there only if no CT's rootfs still
+# references it. Running sessions keep their old golden until they are
+# rebuilt; a failed bake leaves the current golden untouched (and the
+# half-built CT in the other slot for inspection; the next bake replaces it).
+#
+# The golden is a pseudo-instance named "golden" (hostname
+# ai-sandbox-golden, state under $STATE_DIR/golden), so it shares the
+# lock, firewall, guard and destroy code with the agent instances. The
+# hook ignores it ("golden" is never a profile) and it has no hookscript.
+# Needs a rootfs STORAGE that supports linked clones (lvmthin, zfspool, rbd).
+
+GOLDEN_SLOTS=()
+BAKE_AGENT_LIST=()
+
+storage_type() {   # $1 = storage ID; echoes its type from $STORAGE_CFG
+  awk -v s="$1" '/^[a-z]+: / && $2 == s { sub(/:$/, "", $1); print $1; exit }' "$STORAGE_CFG" 2>/dev/null
+}
+
+golden_storage_ok() {
+  local t
+  t="$(storage_type "$STORAGE")"
+  case "$t" in
+    lvmthin|zfspool|rbd) return 0 ;;
+  esac
+  die "bake: storage '$STORAGE' (type '${t:-unknown}' in $STORAGE_CFG) cannot hold linked clones; use an lvmthin, zfspool or rbd storage (STORAGE=...)"
+}
+
+golden_current() {   # echoes the current golden CTID, if recorded
+  local f="${STATE_DIR}/golden/current" id
+  [ -f "$f" ] || return 0
+  id="$(cat "$f" 2>/dev/null)"
+  [[ "$id" =~ ^[0-9]+$ ]] && echo "$id"
+  return 0
+}
+
+golden_clones_of() {   # $1 = golden CTID; echoes CTs whose rootfs is a linked clone of it
+  local vmid
+  for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    [ "$vmid" = "$1" ] && continue
+    pct config "$vmid" 2>/dev/null | grep -qE "^rootfs: [^ ]*base-${1}-disk-" && echo "$vmid"
+  done
+  return 0
+}
+
+# Resolve settings for `bake`: global config only (the golden serves every
+# agent), the two slots, the agents to bake in, then the slot to build in.
+select_golden() {
+  AGENT=golden
+  load_config_file "${STATE_DIR}/config.env"
+  local s a profile_ids
+  GOLDEN_CTIDS="${GOLDEN_CTIDS:-1048,1049}"
+  mapfile -t GOLDEN_SLOTS < <(csv_entries "$GOLDEN_CTIDS")
+  [ "${#GOLDEN_SLOTS[@]}" -eq 2 ] && [ "${GOLDEN_SLOTS[0]}" != "${GOLDEN_SLOTS[1]}" ] \
+    || die "GOLDEN_CTIDS='$GOLDEN_CTIDS' must be two different CT IDs, e.g. 1048,1049"
+  profile_ids=" $(for a in $(list_profiles); do ( "profile_${a}_meta"; echo "$PROFILE_CTID" ); done | paste -sd' ' -) "
+  for s in "${GOLDEN_SLOTS[@]}"; do
+    [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 100 ] || die "invalid golden CT ID '$s' in GOLDEN_CTIDS"
+    [[ "$profile_ids" != *" $s "* ]] || die "golden CT ID $s collides with an agent's CTID; change GOLDEN_CTIDS"
+  done
+  BAKE_AGENTS="${BAKE_AGENTS:-all}"
+  if [ "$BAKE_AGENTS" = all ]; then
+    read -r -a BAKE_AGENT_LIST <<<"$(list_profiles)"
+  else
+    mapfile -t BAKE_AGENT_LIST < <(csv_entries "$BAKE_AGENTS")
+  fi
+  [ "${#BAKE_AGENT_LIST[@]}" -gt 0 ] || die "BAKE_AGENTS='$BAKE_AGENTS' names no agent"
+  for a in "${BAKE_AGENT_LIST[@]}"; do
+    profile_exists "$a" || die "unknown agent '$a' in BAKE_AGENTS; known agents: $(list_profiles)"
+    declare -F "profile_${a}_credential_paths" >/dev/null \
+      || die "profile '$a' has no credential_paths part; bake cannot prove its credential stays out of the image"
+  done
+  CTID="$(golden_pick_slot)"
+  PROFILE_CTID="$CTID"
+  PROFILE_LABEL="golden template"
+  PROFILE_VSCODE_EXT=""
+  apply_defaults
+}
+
+golden_pick_slot() {   # echoes the slot to bake into; never the current golden
+  local cur s users
+  cur="$(golden_current)"
+  for s in "${GOLDEN_SLOTS[@]}"; do
+    [ "$s" != "$cur" ] && ! pct status "$s" >/dev/null 2>&1 && { echo "$s"; return 0; }
+  done
+  for s in "${GOLDEN_SLOTS[@]}"; do
+    [ "$s" = "$cur" ] && continue
+    users="$(golden_clones_of "$s" | paste -sd' ' -)"
+    [ -z "$users" ] && { echo "$s"; return 0; }
+    die "bake: both golden slots are busy - CT $cur is the current golden, and CT $s still backs linked clone(s): $users. Rebuild those sandboxes ('up <agent>', or GUI Stop) so they move to CT $cur, then bake again"
+  done
+  die "bake: no usable golden slot in GOLDEN_CTIDS='$GOLDEN_CTIDS'"
+}
+
+# Everything a session must not inherit from the image. Runs in the build CT
+# after provisioning; Debian regenerates machine-id at boot, and spawn
+# regenerates SSH host keys and re-injects root's authorized key.
+golden_strip_script() {
+  cat <<'EOF'
+set -e
+rm -f /etc/ssh/ssh_host_*
+: > /etc/machine-id
+rm -f /var/lib/dbus/machine-id
+rm -f /root/.ssh/authorized_keys /root/provision-base.sh /root/.bash_history
+apt-get clean
+rm -rf /tmp/* /var/tmp/* /root/.cache
+journalctl --rotate --vacuum-time=1s >/dev/null 2>&1 || true
+EOF
+}
+
+# Fail closed if any agent's credential is in the image. Nothing injects
+# credentials during a bake; this proves it rather than assuming it.
+golden_leak_check() {
+  local a p leaks=""
+  for a in "${BAKE_AGENT_LIST[@]}"; do
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      ct_run test -e "$p" && leaks="${leaks}  $a: $p"$'\n'
+    done < <("profile_${a}_credential_paths")
+  done
+  [ -z "$leaks" ] || die "bake: credential path(s) present in the golden image - refusing to template it:"$'\n'"${leaks}CT $CTID is left stopped for inspection; the current golden is unchanged"
+}
+
+report_bake_failure() {
+  local rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  echo "bake: FAILED (exit $rc) - CT $CTID was not templated; the current golden$(c="$(golden_current)"; [ -n "$c" ] && echo " (CT $c)") is unchanged. Read the output above, then re-run: $0 bake"
+}
+
+cmd_bake() {
+  self_check bake
+  [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
+  lock_or_die
+  validate_hardening_config
+  golden_storage_ok
+  local prev a v stamp tmp
+  prev="$(golden_current)"
+  destroy_sandbox   # the old template in this slot, if any (guarded; never the current one)
+  shared_setup
+  echo "baking golden template in CT $CTID for: ${BAKE_AGENT_LIST[*]} (from $TEMPLATE) ..."
+  trap report_bake_failure EXIT
+  configure_firewall
+  local net0="name=eth0,bridge=${BRIDGE},ip=dhcp"
+  firewall_active && net0="${net0},firewall=1"
+  pct create "$CTID" "$TEMPLATE" \
+    --hostname "$CTHOST" \
+    --cores "$CORES" --memory "$RAM_MB" --swap "$SWAP_MB" \
+    --rootfs "${STORAGE}:${DISK_GB}" \
+    --net0 "$net0" \
+    --unprivileged 1 \
+    --features nesting=1 \
+    --tags "${SANDBOX_TAG};golden" \
+    --onboot 0 \
+    --start 1
+  wait_for_ip >/dev/null || die "bake: CT $CTID started but got no IP (check ${BRIDGE}/DHCP)"
+
+  echo "provisioning base toolchain and ${BAKE_AGENT_LIST[*]} ..."
+  tmp="$(mktemp)"
+  provision_script "${BAKE_AGENT_LIST[@]}" > "$tmp"
+  ct_push_file "$tmp" /root/provision-base.sh 700
+  rm -f "$tmp"
+  ct_run bash /root/provision-base.sh
+
+  stamp="baked=$(date -u +%Y-%m-%dT%H:%M:%SZ) ctid=$CTID agents=$(IFS=,; echo "${BAKE_AGENT_LIST[*]}")"
+  for a in "${BAKE_AGENT_LIST[@]}"; do
+    v="$(ct_run bash -c "$("profile_${a}_verify")" 2>&1 | head -n1)" || true
+    stamp="${stamp}"$'\n'"${a}: ${v:-unknown}"
+  done
+  tmp="$(mktemp)"
+  printf '%s\n' "$stamp" > "$tmp"
+  ct_push_file "$tmp" /etc/ai-sandbox-golden 444
+  rm -f "$tmp"
+
+  echo "stripping host keys, machine-id, authorized_keys and caches ..."
+  ct_run bash -c "$(golden_strip_script)"
+  golden_leak_check
+
+  pct stop "$CTID"
+  remove_firewall   # the template never runs; each clone gets its own ruleset
+  pct template "$CTID"
+  mkdir -p "$INSTANCE_DIR"
+  printf '%s\n' "$CTID" > "${INSTANCE_DIR}/current"
+  printf '%s\n' "$stamp" > "${INSTANCE_DIR}/stamp"
+  trap - EXIT
+
+  echo "golden template ready: CT $CTID"
+  sed 's/^/  /' <<<"$stamp"
+  [ -n "$prev" ] && echo "previous golden CT $prev is kept while sandboxes still run from it; the next bake reuses its slot"
+  return 0
+}
+
+print_golden_summary() {   # one line per golden slot that exists, for `status`
+  local cur vmid host role users
+  cur="$(golden_current)"
+  for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+    host="$(pct config "$vmid" 2>/dev/null | awk '/^hostname:/ {print $2}')"
+    [ "$host" = "ai-sandbox-golden" ] || continue
+    role="previous"; [ "$vmid" = "$cur" ] && role="current"
+    users="$(golden_clones_of "$vmid" | paste -sd' ' -)"
+    if pct config "$vmid" 2>/dev/null | grep -q '^template: 1'; then
+      printf 'golden: CT %s template (%s)%s%s\n' "$vmid" "$role" \
+        "$([ "$role" = current ] && [ -f "${STATE_DIR}/golden/stamp" ] && echo ", $(head -n1 "${STATE_DIR}/golden/stamp")")" \
+        "${users:+, linked clones: $users}"
+    else
+      printf 'golden: CT %s NOT a template (failed or interrupted bake; the next bake replaces it)\n' "$vmid"
+    fi
+  done
 }
 
 # --------------------------- subcommands ------------------------------------
@@ -1497,7 +1728,7 @@ cmd_status_all() {
   printf '%-10s %-6s %-8s %-15s %s\n' AGENT CTID STATE IP PROVISIONED
   for vmid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
     host="$(pct config "$vmid" 2>/dev/null | awk '/^hostname:/ {print $2}')"
-    case "$host" in ai-sandbox-?*) ;; *) continue ;; esac
+    case "$host" in ai-sandbox-golden) continue ;; ai-sandbox-?*) ;; *) continue ;; esac
     found=1
     state="$(pct status "$vmid" 2>/dev/null | awk '{print $2}')"
     ip=""
@@ -1510,6 +1741,7 @@ cmd_status_all() {
     printf '%-10s %-6s %-8s %-15s %s\n' "${host#ai-sandbox-}" "$vmid" "${state:-?}" "${ip:--}" "$ready"
   done
   [ "$found" = 1 ] || echo "(no ai-sandbox CTs on this node)"
+  print_golden_summary
 }
 
 cmd_agents() {
@@ -1567,6 +1799,7 @@ case "$cmd" in
     if [ $# -gt 0 ] && profile_exists "$1"; then select_agent "$1"; shift
     else select_agent ""; fi ;;
   status) [ -z "${1:-${AGENT:-}}" ] || select_agent "${1:-}" ;;
+  bake)   select_golden ;;
   park-deferred)   # <agent> <vmid>: the vmid wins over config, as in hooks
     [[ "${2:-}" =~ ^[0-9]+$ ]] || die "park-deferred: usage: $0 park-deferred <agent> <vmid>"
     CTID="$2"; select_agent "${1:-}" ;;
@@ -1585,6 +1818,7 @@ case "$cmd" in
   update) cmd_update ;;
   hook)   cmd_hook "$@" ;;
   park-deferred) cmd_park_deferred ;;
+  bake)   cmd_bake ;;
   *) awk 'NR == 1 || /^# ====/ {next} /^set -/ {exit} /^#/ {sub(/^# ?/, ""); print}' "$0"; exit 1 ;;
 esac
 
