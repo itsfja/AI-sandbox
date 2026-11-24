@@ -602,6 +602,7 @@ check "  ...with the AI Studio hint" grep -q 'aistudio.google.com' <<<"$out"
 P="$T/ct/1053/root/provision-base.sh"
 check_sh "  ...Node >= 20 from NodeSource only when missing or too old, then the npm package" 'grep -q "process.versions.node.split" "$P" && grep -q "deb.nodesource.com/setup_22.x" "$P" && grep -q "npm install -g --no-fund --no-audit @google/gemini-cli" "$P" && [ "$(tail -n1 "$P")" = "gemini --version" ]'
 check "  ...provision script is valid bash" bash -n "$P"
+check_sh "  ...and installs the key launcher (folder trust blocks ~/.gemini/.env)" 'grep -q "GEMINI_API_KEY from ~/.gemini/.env, also in untrusted folders" "$P" && grep -q "> /usr/local/bin/gemini" "$P"'
 G="$T/ct/1053/etc/gemini-cli/settings.json"
 check "system settings injected, mode 444" [ "$(stat -c %a "$G" 2>/dev/null)" = 444 ]
 check_sh "  ...valid JSON, every default-deny key" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); s=d[\"security\"]; a=d[\"admin\"]; assert s[\"disableYoloMode\"] is True and s[\"disableAlwaysAllow\"] is True and s[\"blockGitExtensions\"] is True and a[\"secureModeEnabled\"] is True and a[\"mcp\"][\"enabled\"] is False and a[\"extensions\"][\"enabled\"] is False and d[\"mcp\"][\"allowed\"]==[]" "$G"'

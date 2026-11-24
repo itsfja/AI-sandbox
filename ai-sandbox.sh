@@ -337,6 +337,21 @@ if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.spli
   apt-get install -y -qq --no-install-recommends -o Dpkg::Use-Pty=0 nodejs
 fi
 npm install -g --no-fund --no-audit @google/gemini-cli
+# Gemini CLI loads no .env file in a folder it does not trust, not even
+# ~/.gemini/.env (seen on pve1: "must specify GEMINI_API_KEY"). Folder
+# trust stays on; this launcher, first on PATH, reads the sandbox's own key
+# file, never a project's, then runs the real CLI.
+real="$(command -v gemini)"
+if [ "$real" != /usr/local/bin/gemini ]; then
+  printf '%s\n' '#!/bin/sh' \
+    '# ai-sandbox: GEMINI_API_KEY from ~/.gemini/.env, also in untrusted folders' \
+    'if [ -z "${GEMINI_API_KEY:-}" ] && [ -r "${HOME:-/root}/.gemini/.env" ]; then' \
+    '  GEMINI_API_KEY="$(sed -n "s/^GEMINI_API_KEY=//p" "${HOME:-/root}/.gemini/.env" | tail -n 1)"' \
+    '  export GEMINI_API_KEY' \
+    'fi' \
+    "exec $real \"\$@\"" > /usr/local/bin/gemini
+  chmod 755 /usr/local/bin/gemini
+fi
 EOF
 }
 

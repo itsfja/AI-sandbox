@@ -280,9 +280,11 @@ CT 1053, hostname `ai-sandbox-gemini`.
   written to `/root/.gemini/.env` (mode 600); the user settings select
   API-key sign-in so the first run does not ask. A Google-account login
   (OAuth) is not kept between rebuilds, so the key is the supported route.
-  Caveat: the CLI loads the *first* `.env` it finds going up from the
-  current directory, so inside a project that has its own `.env`, the key
-  in `~/.gemini/.env` is not seen; add `GEMINI_API_KEY` there or export it.
+  Gemini CLI loads no `.env` file at all in a folder you have not trusted
+  (its "safe mode"), not even `~/.gemini/.env`, so a small launcher at
+  `/usr/local/bin/gemini` reads the key from that one sandbox file and
+  starts the real CLI. Folder trust stays on: an untrusted project's own
+  `.env` and settings are still ignored.
 - **Policy**: `/etc/gemini-cli/settings.json`, the system settings file,
   which overrides user and project settings. By default it disables YOLO
   mode and "Always allow" (`security.disableYoloMode`,
