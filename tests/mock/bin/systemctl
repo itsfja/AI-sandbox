@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Mock host systemctl: only `is-active [--quiet] <unit>`.
+#   ai-sandbox-park-<agent>-<id>  $MOCK_T/park-active/<unit> exists -> active,
+#                                 or its content when non-empty (e.g. activating)
+#   pve-container@<id>            active while $MOCK_T/unit-active/<id> exists
+# Like the real one: prints the state unless --quiet; exit 0 only for active.
+T="${MOCK_T:?}"
+echo "systemctl $*" >> "$T/calls.log"
+[ "$1" = is-active ] || { echo "mock systemctl: unhandled $1" >&2; exit 3; }
+quiet=0; [ "${2:-}" = --quiet ] && quiet=1
+unit="${*: -1}"
+state=inactive
+case "$unit" in
+  ai-sandbox-park-*)
+    f="$T/park-active/$unit"
+    [ -e "$f" ] && { state="$(cat "$f")"; state="${state:-active}"; } ;;
+  pve-container@*) [ -e "$T/unit-active/${unit#pve-container@}" ] && state=active ;;
+esac
+[ "$quiet" = 1 ] || echo "$state"
+[ "$state" = active ] && exit 0
+exit 3

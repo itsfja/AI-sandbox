@@ -27,6 +27,25 @@ run() {   # run the script copy in the mock world
       HOOK_SNIPPET_DIR="$T/snip" AUTO_UPDATE=off TEMPLATE=local:vztmpl/debian-12.tar.zst \
       EXPORT_DIR="$T/export" "$@"
 }
+calls_lack() { ! grep -qE "$1" "$T/calls.log"; }
+hookvars() {   # what reaches an env-less hook or systemd unit: the config, not your shell
+  echo "STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off TEMPLATE=local:vztmpl/d.tar.zst"
+}
+run_deferred() {   # $1 = unit; run the job post-stop handed to systemd-run, env-less like a unit
+  env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" \
+    bash -c "$(hookvars) ${2:-} $(cat "$T/deferred/$1.cmd")" 2>&1
+}
+# A GUI Stop as PVE runs it: the CT has stopped, but `pct status` still says
+# running and the CT config lock is held until post-stop returns. Sets
+# STOP_OUT (hook output) and STOP_RC; the park job is left in deferred/.
+gui_stop_hook() {   # $1 = vmid
+  rm -f "$T/run/$1"; rm -rf "$T/deferred"
+  mkdir -p "$T/locked" "$T/stopping" "$T/unit-active"
+  touch "$T/locked/$1" "$T/stopping/$1" "$T/unit-active/$1"
+  : > "$T/calls.log"
+  STOP_OUT="$(env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "$(hookvars) $S hook $1 post-stop" 2>&1)"; STOP_RC=$?
+  rm -f "$T/locked/$1" "$T/stopping/$1" "$T/unit-active/$1"   # Stop task ends
+}
 add_fake_profile() {   # second agent, to test parallel instances
   python3 - "$S" <<'EOF'
 import sys; p=sys.argv[1]; s=open(p).read()
@@ -185,6 +204,56 @@ check "  ...IdentityFile ~/.ssh/ai-sandbox" grep -q 'IdentityFile ~/.ssh/ai-sand
 check "  ...tarball named per agent" [ -f "$T/export/ai-sandbox-mistral-desktop.tar.gz" ]
 check "  ...prints the VS Code extension hint" grep -q 'mistralai.mistral-vibe-code' <<<"$out"
 
+echo "== GUI Stop: park deferred until Proxmox releases the CT (#17)"
+U=ai-sandbox-park-mistral-1051
+gui_stop_hook 1051
+check "post-stop under the PVE lock exits 0" [ $STOP_RC -eq 0 ]
+[ $STOP_RC -eq 0 ] || echo "$STOP_OUT" | tail -5
+check "  ...without pct stop/destroy/create/set/push (they need the lock)" calls_lack '^pct (stop|destroy|create|set|push) '
+check "  ...schedules a per-instance park unit via systemd-run" grep -q "^systemd-run --unit $U .* park-deferred mistral 1051\$" "$T/calls.log"
+check "  ...and says so in the task log" grep -q 'parking the mistral sandbox (CT 1051) once Proxmox releases it' <<<"$STOP_OUT"
+check "  ...nothing parked yet" [ ! -e "$T/state/mistral/pristine-stub" ]
+mkdir -p "$T/park-active"; touch "$T/park-active/$U" "$T/locked/1051"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check_sh "Start (or Restart's Start half) while the park job runs is refused" '[ $rc -ne 0 ] && grep -q "still being parked.*journalctl -u $U" <<<"$out"'
+echo activating > "$T/park-active/$U"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check_sh "  ...also while the unit is still activating (Restart's quick pre-start)" '[ $rc -ne 0 ] && grep -q "still being parked" <<<"$out"'
+: > "$T/park-active/$U"
+rm -f "$T/locked/1051"
+out="$(run "$S" status mistral 2>&1)"
+check "status says parking is in progress" grep -q 'being parked after GUI Stop' <<<"$out"
+( exec 9>/run/lock/ai-sandbox.mistral.lock; flock -n 9; sleep 3 ) &
+holder=$!; sleep 0.5
+out="$(run "$S" up mistral 2>&1)"; rc=$?
+check_sh "up while the park job holds the lock refuses, naming the unit" '[ $rc -ne 0 ] && grep -q "still being parked after a GUI Stop (unit $U)" <<<"$out"'
+wait "$holder"
+rm -f "$T/park-active/$U"
+# the job waits while PVE still has the CT's unit up
+touch "$T/unit-active/1051"; ( sleep 3; rm -f "$T/unit-active/1051" ) &
+: > "$T/calls.log"; start=$(date +%s)
+out="$(run_deferred $U)"; rc=$?
+check "park job (env-less, like a unit) exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -5
+check "  ...waited for pve-container@1051 to go inactive" [ $(( $(date +%s) - start )) -ge 2 ]
+check "  ...clobbered via blkdiscard -f" grep -q '^blkdiscard -f /dev/' "$T/calls.log"
+check_sh "  ...parked a fresh stub, marked pristine" '[ "$(cat "$T/state/mistral/pristine-stub" 2>/dev/null)" = 1051 ] && [ ! -e "$T/run/1051" ] && [ -f "$T/conf/1051.conf" ]'
+check "  ...says it is ready for GUI Start" grep -q 'parked as a fresh stub - ready for GUI Start' <<<"$out"
+touch "$T/locked/1051"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check_sh "GUI Start then boots the stub" '[ $rc -eq 0 ] && grep -q "fresh, never-booted stub" <<<"$out"'
+rm -f "$T/locked/1051"
+# Stop, then the CT is started again before the job runs: leave it alone
+touch "$T/run/1051"; gui_stop_hook 1051; touch "$T/run/1051"; : > "$T/calls.log"
+out="$(run_deferred $U)"
+check_sh "park job leaves a CT that was started meanwhile alone" 'grep -q "started again meanwhile - not parking" <<<"$out" && calls_lack "^pct (stop|destroy|create) "'
+rm -f "$T/run/1051"
+run_deferred $U >/dev/null   # parks the used CT
+: > "$T/calls.log"; out="$(run_deferred $U)"
+check_sh "park job is a no-op on an already fresh stub" 'grep -q "already a fresh stub" <<<"$out" && calls_lack "^pct (stop|destroy|create) "'
+out="$(run "$S" park-deferred mistral '1051;x' 2>&1)"; rc=$?
+check_sh "park-deferred rejects a non-numeric vmid" '[ $rc -ne 0 ] && grep -q "usage: .* park-deferred <agent> <vmid>" <<<"$out"'
+
 echo "== parallel instances (second, fake agent)"
 fresh; add_fake_profile
 run "$S" up mistral >/dev/null 2>&1
@@ -199,8 +268,11 @@ check "  ...own CTID/hostname" grep -q '^hostname: ai-sandbox-fake$' "$T/conf/10
 check "  ...own MAC, different from mistral's" [ "$(cat "$T/state/fake/mac")" != "$(cat "$T/state/mistral/mac")" ]
 check "  ...shared keypair reused (one key)" [ "$(ls "$T/state/ssh" | wc -l)" = 2 ]
 check "  ...fake policy rendered" grep -q '^mcp=false$' "$T/ct/1059/etc/fake/policy"
+rm -f "$T/run/1059"
 out="$(run "$S" hook 1059 post-stop 2>&1)"
-check "fake hook does work while mistral is locked" grep -q 'fake sandbox clobbered and parked' <<<"$out"
+check_sh "fake post-stop schedules its own park unit while mistral is locked" 'grep -q "parking the fake sandbox (CT 1059)" <<<"$out" && [ -f "$T/deferred/ai-sandbox-park-fake-1059.cmd" ]'
+out="$(run_deferred ai-sandbox-park-fake-1059)"
+check "  ...and the fake park job parks while mistral is locked" grep -q 'fake sandbox (CT 1059) clobbered and parked' <<<"$out"
 wait "$holder"
 out="$(run "$S" status 2>&1)"
 check_sh "status (all) lists both" 'grep -q "^mistral " <<<"$out" && grep -q "^fake " <<<"$out"'
