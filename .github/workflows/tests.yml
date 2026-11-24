@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scripts are executable in git
+        # the PVE hook shim execs ai-sandbox.sh directly from a clone
+        run: |
+          bad=0
+          for f in ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/*; do
+            mode="$(git ls-files -s -- "$f" | cut -d' ' -f1)"
+            [ "$mode" = 100755 ] || { echo "::error file=$f::mode $mode, expected 100755 (git update-index --chmod=+x $f)"; bad=1; }
+          done
+          exit "$bad"
+
+      - name: Syntax check
+        run: |
+          bash -n ai-sandbox.sh
+          bash -n vscode-connect.sh
+          bash -n tests/run-tests.sh
+
+      - name: ShellCheck
+        run: shellcheck -S warning ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/*
+
+      - name: Dry-run tests (mock Proxmox)
+        # needs root for /run/lock and ssh-keygen; refuses to run where /etc/pve exists
+        run: sudo bash tests/run-tests.sh

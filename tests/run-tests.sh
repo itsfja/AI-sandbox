@@ -10,6 +10,10 @@ pass=0; fail=0
 ok()   { echo "  PASS $*"; pass=$((pass+1)); }
 bad()  { echo "  FAIL $*"; fail=$((fail+1)); }
 check() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
+# check_sh "desc" 'COND': COND is evaluated whole, so `a && b` is ONE check.
+# (`check "desc" a && b` runs only `a` inside check; b's result is dropped.)
+# Single-quote COND: $out, $rc and $T expand at evaluation time.
+check_sh() { local d="$1"; shift; if eval "$1"; then ok "$d"; else bad "$d"; fi; }
 
 fresh() {   # new isolated world; sets T and S (script copy)
   T="$(mktemp -d)"; export MOCK_T="$T"
@@ -62,7 +66,7 @@ check "  ...tagged ai-sandbox" grep -q '^tags: ai-sandbox$' "$T/conf/1051.conf"
 check "  ...hookscript attached" grep -q '^hookscript: local:snippets/ai-sandbox-hook.sh$' "$T/conf/1051.conf"
 check "  ...firewall=1 and pinned MAC" grep -qE '^net0: .*hwaddr=02:([0-9a-f]{2}:){4}[0-9a-f]{2},firewall=1' "$T/conf/1051.conf"
 check "MAC retained under state/mistral/mac" grep -qE '^02:' "$T/state/mistral/mac"
-check "shared keypair generated" [ -f "$T/state/ssh/ai-sandbox" ] && [ -f "$T/state/ssh/ai-sandbox.pub" ]
+check_sh "shared keypair generated" '[ -f "$T/state/ssh/ai-sandbox" ] && [ -f "$T/state/ssh/ai-sandbox.pub" ]'
 check "ssh dir is 700" [ "$(stat -c %a "$T/state/ssh")" = 700 ]
 check "hook shim written and executable" [ -x "$T/snip/ai-sandbox-hook.sh" ]
 check "  ...shim calls this script's hook" grep -q "exec $S hook" "$T/snip/ai-sandbox-hook.sh"
@@ -117,7 +121,7 @@ check "foreign CT at 1051 -> up refuses" [ $rc -ne 0 ]
 check "  ...with the guard message" grep -q 'refusing to touch CT 1051' <<<"$out"
 check "  ...and it still exists" grep -q wordpress "$T/conf/1051.conf"
 out="$(run "$S" hook 1051 pre-start 2>&1)"; rc=$?
-check "hook ignores a CT that is not ai-sandbox-*" [ $rc -eq 0 ] && grep -q wordpress "$T/conf/1051.conf"
+check_sh "hook ignores a CT that is not ai-sandbox-*" '[ $rc -eq 0 ] && grep -q wordpress "$T/conf/1051.conf"'
 
 echo "== GUI hook path + down + status/export"
 fresh
@@ -127,7 +131,7 @@ out="$(run FORCE=1 RESCUE=0 "$S" down mistral 2>&1)"; rc=$?
 check "down exits 0" [ $rc -eq 0 ]
 check "  ...clobbered via blkdiscard -f" grep -q '^blkdiscard -f /dev/' "$T/calls.log"
 check "  ...with no clobber failure" bash -c "! grep -q 'blkdiscard failed' <<<\"\$1\"" _ "$out"
-check "  ...stub exists, stopped, hook attached" [ -f "$T/conf/1051.conf" ] && [ ! -e "$T/run/1051" ] && grep -q hookscript "$T/conf/1051.conf"
+check_sh "  ...stub exists, stopped, hook attached" '[ -f "$T/conf/1051.conf" ] && [ ! -e "$T/run/1051" ] && grep -q hookscript "$T/conf/1051.conf"'
 check "  ...pristine-stub marker written for CT 1051" [ "$(cat "$T/state/mistral/pristine-stub" 2>/dev/null)" = 1051 ]
 out="$(run "$S" status mistral 2>&1)"
 check "status reports a fresh stub" grep -q 'stopped: fresh stub, ready for GUI Start' <<<"$out"
@@ -146,9 +150,9 @@ check "  ...and consumes the marker" [ ! -e "$T/state/mistral/pristine-stub" ]
 # PVE boots it and runs post-start STILL holding the CT config lock
 touch "$T/run/1051"; : > "$T/calls.log"
 out="$(gui_hook 1051 post-start)"; rc=$?
-check "GUI post-start under the PVE lock provisions + reports" [ $rc -eq 0 ] && grep -q 'mistral sandbox ready via GUI' <<<"$out"
+check_sh "GUI post-start under the PVE lock provisions + reports" '[ $rc -eq 0 ] && grep -q "mistral sandbox ready via GUI" <<<"$out"'
 [ $rc -eq 0 ] || echo "$out" | tail -5
-check "  ...provision script, credentials-free policy file in place" [ -f "$T/ct/1051/root/provision-base.sh" ] && [ -f "$T/ct/1051/root/.vibe/config.toml" ]
+check_sh "  ...provision script, credentials-free policy file in place" '[ -f "$T/ct/1051/root/provision-base.sh" ] && [ -f "$T/ct/1051/root/.vibe/config.toml" ]'
 check "  ...without pct push (it needs the lock)" bash -c "! grep -q '^pct push ' '$T/calls.log'"
 check "  ...provisioning runs in a clean env with HOME=/root (PVE hooks have none)" grep -qE '^pct exec 1051 -- env -i HOME=/root .*PATH=/root/.local/bin:[^ ]* bash /root/provision-base.sh$' "$T/calls.log"
 check "  ...hook output is ASCII-only (PVE task log mangles UTF-8)" bash -c "! LC_ALL=C grep -q '[^ -~]' <<<\"\$1\"" _ "$out"
@@ -166,7 +170,7 @@ check "status flags the used stopped CT" grep -q 'NOT a fresh stub' <<<"$out"
 run FORCE=1 RESCUE=0 "$S" down mistral >/dev/null 2>&1
 touch "$T/locked/1051"
 out="$(gui_hook_fw_off() { env -i PATH="$HERE/bin:/usr/bin:/bin" MOCK_T="$T" bash -c "FIREWALL=off STATE_DIR=$T/state FW_DIR=$T/fw HOOK_SNIPPET_DIR=$T/snip AUTO_UPDATE=off $S hook 1051 pre-start" 2>&1; }; gui_hook_fw_off)"; rc=$?
-check "GUI pre-start refuses when firewall settings changed since park" [ $rc -ne 0 ] && grep -q 'firewall settings changed' <<<"$out"
+check_sh "GUI pre-start refuses when firewall settings changed since park" '[ $rc -ne 0 ] && grep -q "firewall settings changed" <<<"$out"'
 check "  ...and keeps the stub pristine for a later Start" [ -e "$T/state/mistral/pristine-stub" ]
 rm -f "$T/locked/1051"
 out="$(gui_hook 1051 pre-start)"; rc=$?
@@ -199,7 +203,7 @@ out="$(run "$S" hook 1059 post-stop 2>&1)"
 check "fake hook does work while mistral is locked" grep -q 'fake sandbox clobbered and parked' <<<"$out"
 wait "$holder"
 out="$(run "$S" status 2>&1)"
-check "status (all) lists both" grep -q '^mistral ' <<<"$out" && grep -q '^fake ' <<<"$out"
+check_sh "status (all) lists both" 'grep -q "^mistral " <<<"$out" && grep -q "^fake " <<<"$out"'
 
 echo "== tidy-up: ssh, usage, self-update in a git checkout, hook output, apt"
 fresh
@@ -227,7 +231,7 @@ out="$(run AUTO_UPDATE=on RAW_URL=http://127.0.0.1:9/none FORCE=1 RESCUE=0 "$S" 
 check "self-check inside a git checkout is skipped" grep -q "self-check: skipped - running from the git checkout at $T" <<<"$out"
 check "  ...without touching the network" bash -c "! grep -q 'could not fetch' <<<\"\$1\"" _ "$out"
 out="$(run "$S" update 2>&1)"; rc=$?
-check "update refuses in a git checkout, pointing at git pull" [ $rc -ne 0 ] && grep -q 'git -C .* pull' <<<"$out"
+check_sh "update refuses in a git checkout, pointing at git pull" '[ $rc -ne 0 ] && grep -q "git -C .* pull" <<<"$out"'
 rm -rf "$T/.git"
 
 echo "== IPv6: EGRESS_DENY and the public-IPv6 warning"
@@ -246,7 +250,7 @@ check "  ...before the private-range drops" bash -c "[ \$(grep -n 'EGRESS_DENY' 
 out="$(run EGRESS_DENY=2a10:d585:7f66::/48 EGRESS_ALLOW=2a10:d585:7f66:2::50/128 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
 check "EGRESS_ALLOW still punches a hole first" bash -c "[ \$(grep -n 'EGRESS_ALLOW' '$T/fw/1051.fw' | cut -d: -f1) -lt \$(grep -n 'EGRESS_DENY' '$T/fw/1051.fw' | cut -d: -f1) ]"
 out="$(run EGRESS_DENY='2a10::/48;DROP' "$S" up mistral 2>&1)"; rc=$?
-check "invalid EGRESS_DENY entry rejected (no .fw injection)" [ $rc -ne 0 ] && grep -q "invalid IP/CIDR '2a10::/48;DROP' in EGRESS_DENY" <<<"$out"
+check_sh "invalid EGRESS_DENY entry rejected (no .fw injection)" '[ $rc -ne 0 ] && grep -qF "invalid IP/CIDR '\''2a10::/48;DROP'\'' in EGRESS_DENY" <<<"$out"'
 out="$(run MOCK_IPV6="$V6" EGRESS_POLICY=strict FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
 check "strict policy (drops everything) -> no IPv6 warning" bash -c "! grep -q 'public IPv6' <<<\"\$1\"" _ "$out"
 
