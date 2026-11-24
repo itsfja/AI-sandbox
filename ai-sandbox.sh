@@ -11,7 +11,8 @@
 #   purge   <agent>  destroy completely — no stub, gone from the tree
 #   reset   <agent>  down then up (fresh rebuild mid-work)
 #   status  [agent]  one sandbox, or every ai-sandbox CT when no agent given
-#   shell   <agent>  root shell inside the CT
+#   ssh     <agent> [cmd]  ssh in with the managed key (or run cmd)
+#   shell   <agent>  root shell inside the CT (pct enter)
 #   ip      <agent>  current IP (empty if not running)
 #   export  <agent>  desktop bundle: keypair + ssh-config (after 'up')
 #   agents           list the agent profiles this script knows
@@ -272,9 +273,28 @@ install_current_script() {   # $1 = temp file holding the new script; echoes bac
   echo "${self}.bak"
 }
 
+# A copy inside a git checkout is updated with `git pull`: self-update
+# would rewrite a tracked file and leave a .bak beside it, so a later pull
+# conflicts. Detected by a .git entry in the script's directory or above
+# (no dependency on git being installed on the host).
+script_git_checkout() {   # echoes the checkout root, rc 0 when inside one
+  local d
+  d="$(dirname "$(readlink -f "$0")")"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    [ -e "$d/.git" ] && { echo "$d"; return 0; }
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
 self_check() {   # "$@" = full original argv; installs + re-execs once if stale
   [ "$AUTO_UPDATE" = "on" ] || return 0
   [ -z "${AI_SANDBOX_SELF_UPDATED:-}" ] || return 0
+  local repo
+  if repo="$(script_git_checkout)"; then
+    echo "self-check: skipped - running from the git checkout at $repo (update it with git pull)"
+    return 0
+  fi
   local tmp bak
   tmp="$(mktemp 2>/dev/null)" || { echo "self-check: mktemp failed - skipping" >&2; return 0; }
   if ! fetch_current_script "$tmp" 15; then
@@ -938,7 +958,7 @@ export PATH="/root/.local/bin:$PATH"
 
 # general-purpose baseline: the agent extends this at runtime as needed
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
+apt-get install -y -qq --no-install-recommends -o Dpkg::Use-Pty=0 \
   ca-certificates curl wget git build-essential \
   python3 python3-pip python3-venv \
   unzip zip jq ripgrep man-db sudo locales || true
@@ -1008,6 +1028,7 @@ print_ssh_line() {
   else
     echo "  ssh root@${ip}"
   fi
+  echo "  (or on this host: $(readlink -f "$0") ssh ${AGENT})"
 }
 
 # Every rebuild mints a fresh SSH host key, so a stale known_hosts
@@ -1236,6 +1257,9 @@ hook_agent_for() {   # $1 = vmid; echoes agent or nothing
 # per agent, so another agent's build never makes this one pass through.
 cmd_hook() {
   local vmid="${1:-}" phase="${2:-}" agent
+  # One stream for the PVE task log: it reads stdout and stderr separately,
+  # so warnings otherwise land out of order (after "ready via GUI").
+  exec 2>&1
   [[ "$vmid" =~ ^[0-9]+$ ]] || exit 0
   agent="$(hook_agent_for "$vmid")"
   [ -n "$agent" ] || exit 0
@@ -1332,6 +1356,19 @@ cmd_agents() {
   done
 }
 
+# ssh into the sandbox with the managed key: `ssh <agent> [command...]`.
+# Host keys rotate on every rebuild; build paths purge the stale
+# known_hosts entry, and accept-new records the fresh key on first use
+# (a key CHANGING under a live sandbox would still be refused).
+cmd_ssh() {   # "$@" = optional remote command
+  ct_running || die "$AGENT sandbox not running; run '$0 up $AGENT' first"
+  local ip keyargs=()
+  ip="$(sandbox_ip)"
+  [ -n "$ip" ] || die "no IP for the $AGENT sandbox (check ${BRIDGE}/DHCP)"
+  [ -z "$SSH_PUBKEY" ] && keyargs=(-i "$SSH_KEY_FILE" -o IdentitiesOnly=yes)
+  exec ssh "${keyargs[@]}" -o StrictHostKeyChecking=accept-new "root@${ip}" "$@"
+}
+
 cmd_shell() {
   ct_running || die "$AGENT sandbox not running; run '$0 up $AGENT' first"
   pct enter "$CTID"
@@ -1342,7 +1379,10 @@ cmd_shell() {
 # no-op is quiet.
 cmd_update() {
   [ "$EUID" -eq 0 ] || die "must run as root on the Proxmox host"
-  local self tmp bak
+  local self tmp bak repo
+  if repo="$(script_git_checkout)"; then
+    die "this copy lives in the git checkout at $repo - update it with: git -C $repo pull"
+  fi
   self="$(readlink -f "$0")"
   tmp="$(mktemp)" || die "mktemp failed"
   fetch_current_script "$tmp" 60 || die "could not fetch/validate $RAW_URL"
@@ -1360,6 +1400,9 @@ cmd="${1:-}"
 [ $# -gt 0 ] && shift
 case "$cmd" in
   up|down|purge|reset|shell|ip|export) select_agent "${1:-}" ;;
+  ssh)    # ssh <agent> [command...]; the agent may come from AGENT= instead
+    if [ $# -gt 0 ] && profile_exists "$1"; then select_agent "$1"; shift
+    else select_agent ""; fi ;;
   status) [ -z "${1:-${AGENT:-}}" ] || select_agent "${1:-}" ;;
 esac
 case "$cmd" in
@@ -1370,11 +1413,12 @@ case "$cmd" in
   status) if [ -n "${AGENT:-}" ]; then cmd_status; else cmd_status_all; fi ;;
   ip)     sandbox_ip ;;
   shell)  cmd_shell ;;
+  ssh)    cmd_ssh "$@" ;;
   export) cmd_export ;;
   agents) cmd_agents ;;
   update) cmd_update ;;
   hook)   cmd_hook "$@" ;;
-  *) awk '/^set -/ {exit} /^#/ {print}' "$0"; exit 1 ;;
+  *) awk 'NR == 1 || /^# ====/ {next} /^set -/ {exit} /^#/ {sub(/^# ?/, ""); print}' "$0"; exit 1 ;;
 esac
 
 # --------------------------- usage patterns (optional) -----------------------

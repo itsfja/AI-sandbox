@@ -104,8 +104,9 @@ chmod +x /root/ai-sandbox.sh
 ```
 
 Prefer git? `git clone https://github.com/itsfja/AI-sandbox.git` and use
-the script from the checkout; every later step is identical. The script
-keeps itself current from then on (see [Self-update](#self-update)).
+the script from the checkout; every later step is identical. A curl copy
+keeps itself current (see [Self-update](#self-update)); a git checkout is
+updated with `git pull` instead, and the script never rewrites it.
 
 ### 2. Add the agent's credential (one time per agent)
 
@@ -170,10 +171,14 @@ the message above them and check [Troubleshooting](#troubleshooting).
 ### 5. Get inside
 
 ```bash
-ssh -i /root/.ai-sandbox/ssh/ai-sandbox root@$(/root/ai-sandbox.sh ip mistral)
+/root/ai-sandbox.sh ssh mistral
 ```
 
-Then start the agent (`vibe` for Mistral). Other doors in:
+That is shorthand for `ssh -i /root/.ai-sandbox/ssh/ai-sandbox root@<ip>`;
+add a command to run just that (`/root/ai-sandbox.sh ssh mistral vibe --version`).
+There is no root password: a plain `ssh root@<ip>` without the key asks
+for one and never gets in. Then start the agent (`vibe` for Mistral).
+Other doors in:
 
 - `/root/ai-sandbox.sh shell mistral` on the **host** — a root shell in
   the CT (`pct enter`, no password).
@@ -622,7 +627,8 @@ References: [Vibe Work Connectors](https://docs.mistral.ai/vibe/work/connectors)
 | `reset <agent>` | `down` then `up` — fresh rebuild mid-work |
 | `status [agent]` | one agent's CTID, state, IP and firewall; every ai-sandbox CT when no agent is given |
 | `ip <agent>` | the current IP (empty if not running) |
-| `shell <agent>` | root shell inside the CT |
+| `ssh <agent> [command]` | ssh in with the managed key (or run one command) |
+| `shell <agent>` | root shell inside the CT (`pct enter`) |
 | `export <agent>` | desktop bundle (keypair copy + ssh-config + per-OS instructions) |
 | `agents` | list the agent profiles and their default CTIDs |
 | `update` | self-update the script from `main` (previous copy kept beside it) |
@@ -637,7 +643,9 @@ installed (after passing `bash -n`; the previous copy is kept as
 `ai-sandbox.sh.bak`; the swap is an atomic `mv`) and the script re-runs
 itself once. If the check cannot run (offline, timeout, invalid file) it
 warns and proceeds. `AUTO_UPDATE=off` disables it;
-`/root/ai-sandbox.sh update` does it on demand.
+`/root/ai-sandbox.sh update` does it on demand. A copy inside a git
+checkout is never self-updated (that would rewrite a tracked file and
+break the next `git pull`); update it with `git pull`.
 
 Honest caveats: this is code that runs as root, fetched from GitHub
 without further review — the trust boundary is this repo's `main`
@@ -722,8 +730,10 @@ PVE hookscript.)
   Wait for it to finish, then try once.
 - `self-check: could not fetch/validate ...` (warning, build continues) —
   the self-update check could not reach `RAW_URL`; harmless offline.
-- GUI console refuses every login — by design: no root password, key-only
-  SSH. Use ssh or `shell <agent>`.
+- GUI console refuses every login, or ssh asks for a password — by
+  design: no root password, key-only SSH. Use
+  `/root/ai-sandbox.sh ssh <agent>` (or `ssh -i
+  /root/.ai-sandbox/ssh/ai-sandbox root@<ip>`), or `shell <agent>`.
 - `REMOTE HOST IDENTIFICATION HAS CHANGED` — expected after a rebuild
   (fresh host keys). `up` and GUI Start purge the host-side entry
   automatically; on a desktop with a hand-rolled config,
