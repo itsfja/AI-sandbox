@@ -529,7 +529,12 @@ check_sh "  ...service runs this script's bake, oneshot" 'grep -qx "ExecStart=$S
 check_sh "  ...timer: weekly default, persistent, jittered" 'grep -qx "OnCalendar=Sun \*-\*-\* 03:00:00" "$T/units/ai-sandbox-bake.timer" && grep -qx "Persistent=true" "$T/units/ai-sandbox-bake.timer" && grep -qx "RandomizedDelaySec=30min" "$T/units/ai-sandbox-bake.timer"'
 check_sh "  ...reloaded and enabled" 'grep -qx "systemctl daemon-reload" "$T/calls.log" && grep -qx "systemctl enable --now ai-sandbox-bake.timer" "$T/calls.log"'
 out="$(run "$S" timer 2>&1)"
-check_sh "timer shows schedule, next run, last result" 'grep -q "^bake timer: on (Sun \*-\*-\* 03:00:00)" <<<"$out" && grep -q "ai-sandbox-bake.timer" <<<"$out" && grep -q "last bake: success" <<<"$out"'
+check_sh "timer shows schedule and next run" 'grep -q "^bake timer: on (Sun \*-\*-\* 03:00:00)" <<<"$out" && grep -q "ai-sandbox-bake.timer" <<<"$out"'
+check "  ...and a bake that never ran as 'never run yet', not 'success'" grep -q 'last bake: never run yet' <<<"$out"
+echo exit-code > "$T/bake-ran"
+out="$(run "$S" timer 2>&1)"
+check "  ...and a failed last bake as failed, with when" grep -q 'last bake: exit-code (started Sun 2026-11-29 03:21:18 GMT)' <<<"$out"
+rm -f "$T/bake-ran"
 out="$(run "$S" status 2>&1)"
 check "status (all) mentions the timer" grep -q '^bake timer: on (Sun \*-\*-\* 03:00:00) - details: .* timer' <<<"$out"
 printf 'BAKE_SCHEDULE="Wed *-*-* 02:30:00"\n' > "$T/state/config.env"

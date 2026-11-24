@@ -1699,7 +1699,15 @@ EOF
       fi
       echo "bake timer: on ($(sed -n 's/^OnCalendar=//p' "$tmr"))"
       systemctl list-timers "${BAKE_UNIT}.timer" --all --no-pager 2>/dev/null | sed -n '1,2p' | sed 's/^/  /'
-      echo "  last bake: $(systemctl show "${BAKE_UNIT}.service" -p Result --value 2>/dev/null || echo unknown) - logs: journalctl -u ${BAKE_UNIT}.service"
+      # systemd reports Result=success for a unit that never ran: check it started
+      local started result
+      started="$(systemctl show "${BAKE_UNIT}.service" -p ExecMainStartTimestamp --value 2>/dev/null)"
+      result="$(systemctl show "${BAKE_UNIT}.service" -p Result --value 2>/dev/null)"
+      if [ -z "$started" ] || [ "$started" = "n/a" ]; then
+        echo "  last bake: never run yet (to run one now: systemctl start ${BAKE_UNIT}.service)"
+      else
+        echo "  last bake: ${result:-unknown} (started $started) - logs: journalctl -u ${BAKE_UNIT}.service"
+      fi
       ;;
     *) die "usage: $0 timer [on|off]" ;;
   esac

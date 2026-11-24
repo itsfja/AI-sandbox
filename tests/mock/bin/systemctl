@@ -9,7 +9,11 @@ echo "systemctl $*" >> "$T/calls.log"
 case "$1" in
   daemon-reload|enable|disable) exit 0 ;;
   list-timers) echo "NEXT                        LEFT LAST PASSED UNIT                 ACTIVATES"; echo "Sun 2026-11-29 03:12:00 GMT 4d   -    -      ai-sandbox-bake.timer ai-sandbox-bake.service"; exit 0 ;;
-  show) echo success; exit 0 ;;
+  show)   # Result is "success" even for a unit that never ran, as on a real host
+    case "$*" in
+      *ExecMainStartTimestamp*) [ -e "$T/bake-ran" ] && echo "Sun 2026-11-29 03:21:18 GMT"; exit 0 ;;
+      *Result*) [ -e "$T/bake-ran" ] && cat "$T/bake-ran" || echo success; exit 0 ;;
+    esac; exit 0 ;;
   is-active) ;;
   *) echo "mock systemctl: unhandled $1" >&2; exit 3 ;;
 esac
