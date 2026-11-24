@@ -3,13 +3,13 @@
 set -euo pipefail
 T="${MOCK_T:?}"
 mkdir -p "$T/conf" "$T/ct" "$T/run"
-echo "pct $*" >> "$T/calls.log"
+[ -n "${MOCK_NOLOG:-}" ] || echo "pct $*" >> "$T/calls.log"   # lxc-attach logs itself
 cmd="$1"; shift
 # Proxmox holds /run/lock/lxc/pve-config-<id>.lock for a whole Start task,
 # hookscript pre-start included. Tests simulate that by touching
 # $T/locked/<id>: commands that need the lock then time out like PVE does.
 case "$cmd" in
-  create|destroy|set|start|stop|push|template)
+  create|destroy|set|start|stop|push|template|clone|resize)
     if [ -e "$T/locked/${1:-}" ]; then
       echo "trying to acquire lock..." >&2
       echo "can't lock file '/run/lock/lxc/pve-config-$1.lock' - got timeout" >&2
@@ -41,7 +41,7 @@ case "$cmd" in
         --hostname) echo "hostname: $2" >> "$T/conf/$id.conf" ;;
         --tags) echo "tags: $2" >> "$T/conf/$id.conf" ;;
         --net0) echo "net0: $2" >> "$T/conf/$id.conf" ;;
-        --rootfs) echo "rootfs: $2,size=40G" >> "$T/conf/$id.conf" ;;
+        --rootfs) echo "rootfs: ${2%%:*}:vm-$id-disk-0,size=${2##*:}G" >> "$T/conf/$id.conf" ;;
         --hookscript) echo "hookscript: $2" >> "$T/conf/$id.conf" ;;
         --start) start="$2" ;;
       esac
@@ -53,12 +53,43 @@ case "$cmd" in
     true ;;
   start) touch "$T/run/$1" ;;
   stop)  rm -f "$T/run/$1" ;;
-  destroy) rm -f "$T/conf/$1.conf" "$T/run/$1"; rm -rf "$T/ct/$1" ;;
-  set) echo "set $*" >> "$T/calls.log" ;;
+  destroy) rm -f "$T/conf/$1.conf" "$T/run/$1" "$T/lvorigin/vm-$1-disk-0"; rm -rf "$T/ct/$1" ;;
+  set)   # apply --key value pairs to the config, like PVE
+    echo "set $*" >> "$T/calls.log"
+    id="$1"; shift; [ -e "$T/conf/$id.conf" ] || exit 2
+    while [ $# -gt 1 ]; do
+      k="${1#--}"; v="$2"; shift 2
+      grep -v "^$k: " "$T/conf/$id.conf" > "$T/conf/$id.conf.tmp" || true
+      echo "$k: $v" >> "$T/conf/$id.conf.tmp"; mv "$T/conf/$id.conf.tmp" "$T/conf/$id.conf"
+    done ;;
+  clone)  # linked clone of a template: config minus template/hostname, base-<src> rootfs
+    src="$1"; id="$2"; shift 2
+    [ -e "$T/conf/$src.conf" ] || { echo "CT $src does not exist" >&2; exit 2; }
+    [ -e "$T/conf/$id.conf" ] && { echo "CT $id already exists" >&2; exit 2; }
+    grep -q '^template: 1$' "$T/conf/$src.conf" || { echo "CT $src is not a template" >&2; exit 2; }
+    host=""
+    while [ $# -gt 0 ]; do case "$1" in --hostname) host="$2" ;; esac; shift 2; done
+    size="$(sed -n 's/^rootfs: .*size=\([0-9]*G\).*/\1/p' "$T/conf/$src.conf")"
+    grep -vE '^(template|hostname|rootfs): ' "$T/conf/$src.conf" > "$T/conf/$id.conf" || true
+    echo "hostname: ${host:-CT$id}" >> "$T/conf/$id.conf"
+    if [ "${MOCK_CLONE_STYLE:-lvmthin}" = zfs ]; then
+      # zfspool/rbd: the volume ID names the base
+      echo "rootfs: local-zfs:base-$src-disk-0/subvol-$id-disk-0,size=${size:-40G}" >> "$T/conf/$id.conf"
+    else
+      # lvmthin (pve1): a plain vm-<id>-disk-0; only its LVM origin names the base
+      echo "rootfs: local-lvm:vm-$id-disk-0,size=${size:-40G}" >> "$T/conf/$id.conf"
+      mkdir -p "$T/lvorigin"; echo "base-$src-disk-0" > "$T/lvorigin/vm-$id-disk-0"
+    fi
+    # like PVE's clone_vmfw_conf: delete the target's .fw, copy the source's
+    fw="${FW_DIR:-$T/fw}"; rm -f "$fw/$id.fw"; [ -f "$fw/$src.fw" ] && cp "$fw/$src.fw" "$fw/$id.fw"
+    rm -rf "$T/ct/$id"; cp -a "$T/ct/$src" "$T/ct/$id" 2>/dev/null || mkdir -p "$T/ct/$id" ;;
+  resize) echo "resize $*" >> "$T/calls.log" ;;
   enter) echo "(would enter CT $1)" ;;
   template)
     id="$1"; [ -e "$T/conf/$id.conf" ] || exit 2
     [ -e "$T/run/$id" ] && { echo "CT $id is running" >&2; exit 2; }
+    # like PVE on lvmthin: the volume is renamed vm-<id>-disk-0 -> base-<id>-disk-0
+    sed -i "s/^rootfs: \([^:]*\):vm-$id-disk-/rootfs: \1:base-$id-disk-/" "$T/conf/$id.conf"
     echo "template: 1" >> "$T/conf/$id.conf" ;;
   push)
     id="$1"; src="$2"; dest="$3"
@@ -87,7 +118,12 @@ case "$cmd" in
             cat > "$dest"; chmod "$6" "$dest" ;;
           *) echo "${MOCK_IP:-192.168.3.77}" ;;
         esac ;;
-      bash) [ "$2" = "-c" ] && exit 0
+      bash)
+        # MOCK_SSHD_FAIL=1: sshd will not come up after spawn's restart
+        if [ "$2" = "-c" ] && [ -n "${MOCK_SSHD_FAIL:-}" ] && [[ "$3" == *"systemctl restart ssh"* ]]; then
+          echo "Job for ssh.service failed because start of the service was attempted too often." >&2; exit 1
+        fi
+        [ "$2" = "-c" ] && exit 0
         # MOCK_PROVISION_FAIL=1: the base provisioning dies like a broken install
         if [ -n "${MOCK_PROVISION_FAIL:-}" ] && [ "$2" = /root/provision-base.sh ]; then
           echo "bash: line 1: vibe: command not found" >&2; exit 127
