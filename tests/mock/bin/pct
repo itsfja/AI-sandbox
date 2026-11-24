@@ -60,6 +60,11 @@ case "$cmd" in
   exec)
     id="$1"; shift; [ "$1" = "--" ] && shift
     [ -e "$T/run/$id" ] || { echo "CT $id not running" >&2; exit 1; }
+    # ct_run: env -i KEY=VAL... cmd  -> drop the env wrapper
+    if [ "$1" = env ]; then
+      shift; [ "$1" = -i ] && shift
+      while [[ "${1:-}" == *=* ]]; do shift; done
+    fi
     case "$1" in
       mkdir) shift; for a in "$@"; do [ "$a" = -p ] || mkdir -p "$T/ct/$id$a"; done ;;
       chown) : ;;
