@@ -1096,7 +1096,16 @@ assert_firewall_in_place() {
 # Per-session provisioning of a clone (everything else is baked in).
 spawn_provision() {
   echo "spawn: fresh SSH host keys, authorized key, credential and policy for $PROFILE_LABEL ..."
-  ct_run bash -c 'ssh-keygen -A >/dev/null && (systemctl restart ssh >/dev/null 2>&1 || true)'
+  # The golden has no host keys, so on a clone's first boot sshd fails its
+  # pre-start check until systemd's start-rate limit trips (seen on pve1:
+  # once spawn got fast, the restart came within that window and was
+  # refused, silently). Clear the limit, restart, and insist it runs.
+  ct_run bash -c 'set -e
+ssh-keygen -A >/dev/null
+systemctl reset-failed ssh >/dev/null 2>&1 || true
+systemctl restart ssh
+systemctl is-active --quiet ssh' \
+    || die "spawn: sshd did not start in CT $CTID (lxc-attach -n $CTID -- systemctl status ssh)"
   # hooks never run shared_setup, so fall back to the managed key's .pub
   local pub="${SSH_PUBKEY:-${SSH_KEY_FILE}.pub}"
   [ -f "$pub" ] || die "spawn: no SSH public key at $pub (run '$0 up $AGENT' once to generate the keypair)"
@@ -1506,6 +1515,11 @@ golden_strip_script() {
   cat <<'EOF'
 set -e
 rm -f /etc/ssh/ssh_host_*
+# every clone boots without host keys: let sshd make its own before its
+# config test, instead of failing until spawn fixes it
+mkdir -p /etc/systemd/system/ssh.service.d
+printf '[Service]\nExecStartPre=\nExecStartPre=/usr/bin/ssh-keygen -A\nExecStartPre=/usr/sbin/sshd -t\n' \
+  > /etc/systemd/system/ssh.service.d/10-ai-sandbox-hostkeys.conf
 : > /etc/machine-id
 rm -f /var/lib/dbus/machine-id
 rm -f /root/.ssh/authorized_keys /root/provision-base.sh /root/.bash_history

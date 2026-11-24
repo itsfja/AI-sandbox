@@ -387,6 +387,7 @@ check_sh "  ...without a hookscript or pinned MAC" '! grep -qE "^hookscript:|hwa
 check "  ...installs the baseline + every agent CLI, then verifies" grep -q 'curl -LsSf https://mistral.ai/vibe/install.sh | bash' "$T/ct/1048/root/provision-base.sh"
 check "  ...provision script is valid bash" bash -n "$T/ct/1048/root/provision-base.sh"
 check "  ...strips SSH host keys, machine-id, authorized_keys" grep -qF 'rm -f /etc/ssh/ssh_host_*' "$T/calls.log"
+check "  ...and makes clones generate their own host keys at boot" grep -qF 'ExecStartPre=/usr/bin/ssh-keygen -A' "$T/calls.log"
 check "  ...checks every credential path" grep -q 'lxc-attach -n 1048 --clear-env -- env -i .* test -e /root/.vibe/.env$' "$T/calls.log"
 check_sh "  ...never injects a credential or policy" '! grep -q "/root/.vibe/.env\|config.toml" <(find "$T/ct/1048" -type f)'
 check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
@@ -457,7 +458,8 @@ check_sh "  ...with this instance's settings: tag, hookscript, pinned MAC + fire
 check_sh "  ...and none of the golden's identity" '! grep -qE "^template:|golden" "$C1" && grep -q "^hostname: ai-sandbox-mistral$" "$C1"'
 check "  ...started after the settings were applied" bash -c "[ \$(grep -n '^pct set 1051 ' '$T/calls.log' | head -n1 | cut -d: -f1) -lt \$(grep -n '^pct start 1051' '$T/calls.log' | cut -d: -f1) ]"
 check "  ...skips the baseline/CLI provisioning (baked in)" calls_lack 'bash /root/provision-base.sh'
-check "  ...regenerates SSH host keys" grep -q "lxc-attach -n 1051 --clear-env -- env -i .* bash -c ssh-keygen -A" "$T/calls.log"
+check_sh "  ...regenerates SSH host keys in the CT" 'grep -q "^lxc-attach -n 1051 --clear-env -- env -i .* bash -c set -e$" "$T/calls.log" && grep -qx "ssh-keygen -A >/dev/null" "$T/calls.log"'
+check_sh "  ...clears the start-rate limit and insists sshd runs" 'grep -q "^systemctl reset-failed ssh" "$T/calls.log" && grep -qx "systemctl restart ssh" "$T/calls.log" && grep -q "^systemctl is-active --quiet ssh" "$T/calls.log"'
 check_sh "  ...pushes root's authorized key" 'cmp -s "$T/state/ssh/ai-sandbox.pub" "$T/ct/1051/root/.ssh/authorized_keys"'
 check_sh "  ...injects the policy and marks it provisioned" '[ -f "$T/ct/1051/root/.vibe/config.toml" ] && [ "$(cat "$T/state/mistral/provisioned")" = 1051 ]'
 check "  ...prints the ssh line" grep -q 'sandbox ready.' <<<"$out"
@@ -471,6 +473,8 @@ out="$(B "$S" status mistral 2>&1)"
 check "status: built from golden CT 1048 (current)" grep -q '^  built from: golden CT 1048 (current)$' <<<"$out"
 out="$(B MOCK_CLONE_STYLE=zfs FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
 check_sh "zfs-style clone volume (base-N/...) is recognised too" 'grep -q "^rootfs: local-zfs:base-1048-disk-0/subvol-1051" "$C1" && calls_lack "bash /root/provision-base.sh" && [ -f "$T/fw/1051.fw" ]'
+out="$(B MOCK_SSHD_FAIL=1 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"; rc=$?
+check_sh "sshd that will not start fails the spawn loudly, not provisioned" '[ $rc -ne 0 ] && grep -q "spawn: sshd did not start in CT 1051" <<<"$out" && grep -q "up: provisioning FAILED" <<<"$out" && [ ! -e "$T/state/mistral/provisioned" ]'
 out="$(B DISK_GB=60 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
 check "DISK_GB above the golden's size grows the clone" grep -q '^pct resize 1051 rootfs 60G$' "$T/calls.log"
 out="$(B DISK_GB=20 FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"

@@ -118,7 +118,12 @@ case "$cmd" in
             cat > "$dest"; chmod "$6" "$dest" ;;
           *) echo "${MOCK_IP:-192.168.3.77}" ;;
         esac ;;
-      bash) [ "$2" = "-c" ] && exit 0
+      bash)
+        # MOCK_SSHD_FAIL=1: sshd will not come up after spawn's restart
+        if [ "$2" = "-c" ] && [ -n "${MOCK_SSHD_FAIL:-}" ] && [[ "$3" == *"systemctl restart ssh"* ]]; then
+          echo "Job for ssh.service failed because start of the service was attempted too often." >&2; exit 1
+        fi
+        [ "$2" = "-c" ] && exit 0
         # MOCK_PROVISION_FAIL=1: the base provisioning dies like a broken install
         if [ -n "${MOCK_PROVISION_FAIL:-}" ] && [ "$2" = /root/provision-base.sh ]; then
           echo "bash: line 1: vibe: command not found" >&2; exit 127
