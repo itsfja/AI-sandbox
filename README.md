@@ -803,6 +803,12 @@ python3, and `ssh-keygen`, and refuses to run on a real Proxmox host:
 sudo bash tests/run-tests.sh
 ```
 
+CI (`.github/workflows/tests.yml`) runs it on every push to `main` and
+every pull request, after a syntax check, ShellCheck (`-S warning`), and a
+check that the scripts are executable in git. When writing a test, use
+`check_sh "desc" 'a && b'` for a compound condition: `check "desc" a && b`
+only runs `a` inside the check, so `b` is never counted.
+
 It proves the script's logic, not Proxmox's behaviour: test a real build
 on your PVE host before relying on a change.
 

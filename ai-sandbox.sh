@@ -430,8 +430,8 @@ sandbox_ip() {
 }
 
 wait_for_ip() {
-  local ip="" i
-  for i in $(seq 1 45); do
+  local ip=""
+  for _ in $(seq 1 45); do
     ip="$(sandbox_ip)"
     [ -n "$ip" ] && { echo "$ip"; return 0; }
     sleep 2
