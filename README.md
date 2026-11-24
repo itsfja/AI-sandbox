@@ -328,6 +328,7 @@ Settings (all optional):
 | `GOLDEN_CTIDS` | `1048,1049` | the two CT IDs `bake` alternates between (global config only) |
 | `BAKE_AGENTS` | `all` | comma-separated agents whose CLIs `bake` installs (global config only) |
 | `MODE` | `auto` | how sessions are built: `auto` (linked clone of the golden when it has this agent, else full rebuild), `clone` (clone or refuse), `rebuild` (always the full build) |
+| `BAKE_SCHEDULE` | `Sun *-*-* 03:00:00` | when `timer on` bakes: a systemd `OnCalendar` expression (global config only) |
 | `TOPUP` | `off` | `on` = re-run the agent's CLI installer on a clone at spawn, for the latest release |
 
 ## Golden template (bake)
@@ -381,6 +382,26 @@ hookscript; `DISK_GB` can grow the golden's disk size but not shrink it.
   until their next park or `up`; `status <agent>` shows which
   (`built from: golden CT 1048 (current)`).
 - A linked clone lives on the golden's storage, whatever `STORAGE` says.
+
+### Weekly bake (timer)
+
+```bash
+/root/ai-sandbox.sh timer on     # installs + enables ai-sandbox-bake.timer
+/root/ai-sandbox.sh timer        # schedule, next run, last result
+/root/ai-sandbox.sh timer off    # disables + removes it
+```
+
+`timer on` writes `ai-sandbox-bake.service` (oneshot, runs this script's
+`bake`) and `ai-sandbox-bake.timer` to `/etc/systemd/system`: weekly at
+`BAKE_SCHEDULE` (default Sunday 03:00), up to 30 minutes later at random,
+and a missed run catches up at the next boot. Settings come from the
+config files at run time. Logs: `journalctl -u ai-sandbox-bake.service`.
+
+The timer runs the script at the path you ran `timer on` from: from a git
+checkout, that is whatever branch is checked out. A weekly bake fails,
+changing nothing, when both golden slots are busy: a sandbox has been
+running from the older golden since two bakes ago. Rebuild it (`up`, or
+GUI Stop) and the next run succeeds; `timer` shows the failure meanwhile.
 
 ## From your desktop (export)
 
@@ -718,6 +739,7 @@ References: [Vibe Work Connectors](https://docs.mistral.ai/vibe/work/connectors)
 | `export <agent>` | desktop bundle (keypair copy + ssh-config + per-OS instructions) |
 | `agents` | list the agent profiles and their default CTIDs |
 | `bake` | build a golden template with every agent's CLI in the free slot (see [Golden template](#golden-template-bake)) |
+| `timer [on\|off]` | weekly `bake` via a systemd timer; no argument shows its schedule, next run and last result |
 | `update` | self-update the script from `main` (previous copy kept beside it) |
 | `hook` | internal — called by the PVE hookscript shim with (vmid, phase) |
 
@@ -906,12 +928,12 @@ Work is tracked as PTFs (fixes delivered as PRs):
    sandbox refactored into an agent profile; per-agent instances that
    can run in parallel; host state and config files under
    `/root/.ai-sandbox`.
-2. **PTF 2 — bake and spawn**: build a golden template once (`bake`,
-   with a check that no credential ever lands in it), then start each
-   session as a linked clone in seconds (both in; the weekly timer is
-   next). Full rebuild stays available (`MODE=rebuild`). CLIs are as
-   fresh as the last bake; `TOPUP=on` re-installs at spawn when you need
-   the latest.
+2. **PTF 2 — bake and spawn** *(done)*: build a golden template
+   (`bake`, weekly with `timer on`, with a check that no credential ever
+   lands in it), then start each session as a linked clone (~30 s on
+   pve1, from ~1.5 min). Full rebuild stays available (`MODE=rebuild`).
+   CLIs are as fresh as the last bake; `TOPUP=on` re-installs at spawn
+   when you need the latest.
 3. **PTF 3 — Claude Code profile**, API key or subscription token.
 4. **PTF 4 — Gemini CLI profile.**
 5. **PTF 5 — drop-in profiles** for anything else, from

@@ -6,7 +6,13 @@
 # Like the real one: prints the state unless --quiet; exit 0 only for active.
 T="${MOCK_T:?}"
 echo "systemctl $*" >> "$T/calls.log"
-[ "$1" = is-active ] || { echo "mock systemctl: unhandled $1" >&2; exit 3; }
+case "$1" in
+  daemon-reload|enable|disable) exit 0 ;;
+  list-timers) echo "NEXT                        LEFT LAST PASSED UNIT                 ACTIVATES"; echo "Sun 2026-11-29 03:12:00 GMT 4d   -    -      ai-sandbox-bake.timer ai-sandbox-bake.service"; exit 0 ;;
+  show) echo success; exit 0 ;;
+  is-active) ;;
+  *) echo "mock systemctl: unhandled $1" >&2; exit 3 ;;
+esac
 quiet=0; [ "${2:-}" = --quiet ] && quiet=1
 unit="${*: -1}"
 state=inactive
