@@ -17,7 +17,7 @@ and that several agents can run side by side.
 | --- | --- | --- |
 | Mistral Vibe CLI | `mistral` | available |
 | Claude Code | `claude` | available |
-| Gemini CLI | `gemini` | planned (PTF 4) |
+| Gemini CLI | `gemini` | available |
 | anything else | drop-in profile | planned (PTF 5) |
 
 See [Roadmap](#roadmap) for what is coming and the design decisions behind it.
@@ -270,6 +270,32 @@ CT 1052, hostname `ai-sandbox-claude`.
   installs update themselves in the background, so a clone runs at least
   the version the last bake installed.
 - **VS Code extension**: `anthropic.claude-code`.
+
+### Gemini CLI (`gemini`)
+
+CT 1053, hostname `ai-sandbox-gemini`.
+
+- **Credential**: `GEMINI_API_KEY=...` in `/root/.ai-sandbox/gemini/secrets.env`,
+  a key from Google AI Studio (Get API key). Parsed, never executed, and
+  written to `/root/.gemini/.env` (mode 600); the user settings select
+  API-key sign-in so the first run does not ask. A Google-account login
+  (OAuth) is not kept between rebuilds, so the key is the supported route.
+  Caveat: the CLI loads the *first* `.env` it finds going up from the
+  current directory, so inside a project that has its own `.env`, the key
+  in `~/.gemini/.env` is not seen; add `GEMINI_API_KEY` there or export it.
+- **Policy**: `/etc/gemini-cli/settings.json`, the system settings file,
+  which overrides user and project settings. By default it disables YOLO
+  mode and "Always allow" (`security.disableYoloMode`,
+  `security.disableAlwaysAllow`, `admin.secureModeEnabled`;
+  `AGENT_AUTO_APPROVE`), MCP servers (`mcp.allowed: []`,
+  `admin.mcp.enabled: false`; `AGENT_MCP`), and extensions, Gemini's
+  add-ons, which can bring their own tools and MCP servers
+  (`admin.extensions.enabled: false`, `security.blockGitExtensions`;
+  `AGENT_CONNECTORS`).
+- **Install**: Node.js 22 LTS from NodeSource when the CT has no Node 20+
+  (Debian 12 ships 18), then `npm install -g @google/gemini-cli`. Node
+  ends up in the golden template, so every agent's sandbox has it.
+- **VS Code extension**: `google.gemini-cli-vscode-ide-companion`.
 
 ### Writing a profile
 
@@ -964,7 +990,8 @@ Work is tracked as PTFs (fixes delivered as PRs):
    when you need the latest.
 3. **PTF 3 — Claude Code profile** *(done)*: API key or subscription
    token (`claude setup-token`), managed-settings policy.
-4. **PTF 4 — Gemini CLI profile.**
+4. **PTF 4 — Gemini CLI profile** *(done)*: AI Studio key, system
+   settings policy, Node 22 for the npm package.
 5. **PTF 5 — drop-in profiles** for anything else, from
    `/root/.ai-sandbox/profiles/`.
 
