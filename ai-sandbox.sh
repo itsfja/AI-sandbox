@@ -18,6 +18,7 @@
 #   agents           list the agent profiles this script knows
 #   update           self-update from main (previous copy kept as .bak)
 #   hook             INTERNAL — called by the PVE hookscript shim (vmid, phase)
+#   park-deferred    INTERNAL — run by systemd after a GUI Stop (agent, vmid)
 #
 # Each agent is its own INSTANCE: own CTID, hostname (ai-sandbox-<agent>),
 # MAC, credentials and lock, so several sandboxes can run side by side.
@@ -36,8 +37,10 @@
 #
 # Design invariants (carried over from mistral-sandbox; README has detail):
 #   SINGLE USE      nothing persists between sessions; `up` never resumes
-#   GUI-TRAPPED     PVE hookscript: Stop = clobber + fresh stub, Start =
-#                   boot that never-booted stub and provision it
+#   GUI-TRAPPED     PVE hookscript: Stop = clobber + fresh stub (a systemd
+#                   job, once the Stop task has released the CT), Start =
+#                   boot that never-booted stub and provision it. Restart
+#                   is unsupported: use Stop, then Start
 #   GUARDED         destroy/clobber only CTs carrying our hostname AND tag
 #   WORK-GUARDED    teardown refuses to lose unpushed git work; approved
 #                   teardowns are rescue-archived with vzdump first
@@ -139,6 +142,7 @@ apply_defaults() {
   LOCK_FILE="/run/lock/ai-sandbox.${AGENT}.lock"
   GUARD_STAMP="/run/lock/ai-sandbox.${AGENT}.workguard-ok"
   STUB_MARKER="${INSTANCE_DIR}/pristine-stub"   # "this stopped CT has never booted"
+  PARK_UNIT="ai-sandbox-park-${AGENT}-${CTID}"  # transient systemd unit that parks after a GUI Stop
   FORCE="${FORCE:-0}"                  # 1 = skip the work-loss guard prompt (still rescue-archives)
   RESCUE="${RESCUE:-1}"                # 1 = vzdump before an approved guarded teardown
   RESCUE_STORAGE="${RESCUE_STORAGE:-auto}"   # ordered storage IDs; "auto" = first with backup content
@@ -218,7 +222,9 @@ EOF
 
 lock_or_die() {
   exec 9>"$LOCK_FILE"
-  flock -n 9 || die "another ai-sandbox operation is running on the $AGENT sandbox (serial per agent)"
+  flock -n 9 && return 0
+  park_job_active && die "the $AGENT sandbox is still being parked after a GUI Stop (unit $PARK_UNIT); wait a minute and retry. Progress: journalctl -u $PARK_UNIT"
+  die "another ai-sandbox operation is running on the $AGENT sandbox (serial per agent)"
 }
 
 # Hook phases fire from INSIDE the pct call of the operation that already
@@ -947,6 +953,55 @@ park_sandbox() {
   mark_stub_pristine
 }
 
+# GUI Stop cannot park in its own post-stop hook either: Proxmox keeps the
+# CT's config lock for the whole Stop task, the task does not end until the
+# post-stop hook has returned, and `pct status` still says "running"
+# meanwhile. Any pct stop/destroy/create from the hook times out on that
+# lock (seen on pve1 as a second "CT <id> - Stop" task failing). So
+# post-stop only hands the park to a transient systemd unit ($PARK_UNIT,
+# one per agent instance) and returns; the unit waits until PVE has
+# finished the Stop (pve-container@<CTID> inactive, lock released), takes
+# the agent's serial lock, re-checks, then parks. systemd-run, not
+# `cmd &`: a background child of the hook sits in the container's cgroup
+# and is killed with it.
+# "activating" counts: post-stop schedules with --no-block, and a GUI
+# Restart's pre-start can arrive before the unit is fully up.
+park_job_active() {
+  case "$(systemctl is-active "$PARK_UNIT" 2>/dev/null)" in
+    active|activating|reloading) return 0 ;;
+  esac
+  return 1
+}
+
+schedule_park() {
+  if park_job_active; then
+    echo "post-stop: a park job ($PARK_UNIT) is already running"
+    return 0
+  fi
+  systemd-run --unit "$PARK_UNIT" --collect --no-block --quiet \
+    --description "ai-sandbox: park the $AGENT sandbox (CT $CTID) after GUI Stop" \
+    "$(readlink -f "$0")" park-deferred "$AGENT" "$CTID" \
+    || die "post-stop: could not schedule the park job (systemd-run). On the host, run: $0 down $AGENT"
+}
+
+# INTERNAL: body of $PARK_UNIT (run by systemd, outside any PVE task, with
+# no shell environment: settings come from the config files, as in hooks).
+cmd_park_deferred() {
+  exec 9>"$LOCK_FILE"
+  flock -w 600 9 || die "park: timed out waiting for the $AGENT serial lock"
+  local waited=0
+  while systemctl is-active --quiet "pve-container@${CTID}" 2>/dev/null; do
+    [ "$waited" -lt 180 ] || die "park: CT $CTID still not fully stopped after 3 minutes. On the host, run: $0 down $AGENT"
+    sleep 2; waited=$((waited + 2))
+  done
+  ct_exists || { echo "park: CT $CTID is gone - nothing to park"; return 0; }
+  ct_running && { echo "park: CT $CTID was started again meanwhile - not parking it"; return 0; }
+  stub_is_pristine && { echo "park: CT $CTID is already a fresh stub"; return 0; }
+  validate_hardening_config
+  park_sandbox
+  echo "park: $AGENT sandbox (CT $CTID) clobbered and parked as a fresh stub - ready for GUI Start"
+}
+
 # Pristine-stub marker. GUI Start cannot rebuild the CT: Proxmox holds the
 # CT's config lock (/run/lock/lxc/pve-config-<CTID>.lock) for the whole
 # Start task, pre-start hook included, so any pct destroy/create from the
@@ -1286,7 +1341,8 @@ hook_agent_for() {   # $1 = vmid; echoes agent or nothing
 #                mark_stub_pristine); otherwise abort the Start
 #   post-start — wait for IP, provision, log the ssh line
 #   pre-stop   — work guard: refuse stops that would lose unextracted work
-#   post-stop  — clobber + park stub
+#   post-stop  — schedule the park ($PARK_UNIT: clobber + fresh stub), which
+#                runs once PVE has released the CT (see schedule_park)
 # All destructive phases go through guard_ct(): if the CT at $CTID is not
 # provably ours, the hook ABORTS the GUI task instead of touching it.
 # Hook phases lock with hook_lock(), never lock_or_die: a phase can fire
@@ -1312,6 +1368,10 @@ cmd_hook() {
       # on that lock). Boot only a pristine stub left by down / GUI Stop;
       # anything else aborts the Start (non-zero exit) with directions.
       self_check hook "$vmid" "$phase"
+      # checked before hook_lock: the park job holds the serial lock, and a
+      # lock holder would otherwise make this phase pass through and boot
+      # a CT that was never checked (this is also what refuses GUI Restart)
+      ! park_job_active || die "pre-start: CT $CTID is still being parked after the last Stop (unit $PARK_UNIT). Wait a minute, then Start again (GUI Restart always hits this: use Stop, then Start). Progress: journalctl -u $PARK_UNIT"
       hook_lock "$phase" || exit 0
       validate_hardening_config
       guard_ct
@@ -1343,8 +1403,12 @@ cmd_hook() {
       ;;
     post-stop)
       hook_lock "$phase" || exit 0
-      park_sandbox
-      echo "post-stop: $AGENT sandbox clobbered and parked as a fresh stub (CT $CTID)"
+      # no guard_ct here: it may `pct set` (legacy tag heal), which needs
+      # the lock this task holds; the park job guards before it touches
+      # anything (clobber_disk and destroy_sandbox both call guard_ct)
+      schedule_park
+      echo "post-stop: parking the $AGENT sandbox (CT $CTID) once Proxmox releases it (unit $PARK_UNIT, about a minute);"
+      echo "  GUI Start works when it is done. Progress: journalctl -u $PARK_UNIT"
       ;;
     *)
       exit 0 ;;
@@ -1366,7 +1430,9 @@ cmd_status() {
   if ct_running; then
     echo "$AGENT: CT $CTID running, ip: $(sandbox_ip), firewall: ${fw_info}"
   else
-    if stub_is_pristine; then
+    if park_job_active; then
+      echo "$AGENT: CT $CTID stopped: being parked after GUI Stop (unit $PARK_UNIT); GUI Start works when done, firewall: ${fw_info}"
+    elif stub_is_pristine; then
       echo "$AGENT: CT $CTID stopped: fresh stub, ready for GUI Start, firewall: ${fw_info}"
     else
       echo "$AGENT: CT $CTID stopped: NOT a fresh stub (GUI Start will refuse; run '$0 up $AGENT'), firewall: ${fw_info}"
@@ -1445,6 +1511,9 @@ case "$cmd" in
     if [ $# -gt 0 ] && profile_exists "$1"; then select_agent "$1"; shift
     else select_agent ""; fi ;;
   status) [ -z "${1:-${AGENT:-}}" ] || select_agent "${1:-}" ;;
+  park-deferred)   # <agent> <vmid>: the vmid wins over config, as in hooks
+    [[ "${2:-}" =~ ^[0-9]+$ ]] || die "park-deferred: usage: $0 park-deferred <agent> <vmid>"
+    CTID="$2"; select_agent "${1:-}" ;;
 esac
 case "$cmd" in
   up)     cmd_up ;;
@@ -1459,6 +1528,7 @@ case "$cmd" in
   agents) cmd_agents ;;
   update) cmd_update ;;
   hook)   cmd_hook "$@" ;;
+  park-deferred) cmd_park_deferred ;;
   *) awk 'NR == 1 || /^# ====/ {next} /^set -/ {exit} /^#/ {sub(/^# ?/, ""); print}' "$0"; exit 1 ;;
 esac
 

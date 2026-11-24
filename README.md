@@ -50,9 +50,11 @@ See [Roadmap](#roadmap) for what is coming and the design decisions behind it.
   host (`/root/.ai-sandbox/<agent>/mac`), and pinned on every rebuild, so
   one DHCP reservation per agent fixes its IP forever.
 - **GUI-trapped** — the Proxmox GUI drives the lifecycle: right-click
-  Stop = disk clobber + a freshly built, never-booted stub; Start = boot
-  that stub and provision it. One shared `pct` hookscript shim serves
-  every instance and maps the CT back to its agent by hostname.
+  Stop = disk clobber + a freshly built, never-booted stub (about a
+  minute after the Stop task ends); Start = boot that stub and provision
+  it. Restart is not supported: use Stop, then Start. One shared `pct`
+  hookscript shim serves every instance and maps the CT back to its
+  agent by hostname.
 - **Clobbered** — on stop, the rootfs is discarded (`CLOBBER=discard`) or
   zero-filled (`CLOBBER=zero`) and the CT is replaced by a pristine,
   unprovisioned stopped stub.
@@ -471,16 +473,16 @@ flowchart TD
     PS1 -->|fresh stub| PVEB["PVE boots the stub"]
     PS1 -->|anything else| AB["Start aborted:<br/>run 'up agent' on the host"]
     PVEB --> PS2["post-start hook:<br/>provision + inject credentials + policy<br/>ssh line goes to the task log"]
-    T["GUI: right-click Stop / Shutdown"] --> PR2["post-stop hook:<br/>guard + clobber rootfs + park fresh stub"]
-    R["GUI: right-click Restart"] --> PR2
+    T["GUI: right-click Stop / Shutdown"] --> PR1["post-stop hook:<br/>schedule the park job, return"]
+    PR1 --> PR2["park job (systemd unit, after the Stop task ends):<br/>guard + clobber rootfs + park fresh stub"]
     PR2 --> S
 ```
 
 | GUI action | What actually happens |
 | --- | --- |
 | Start | boots the pristine stub left by the last Stop / `down`, then provisions it; the Start task stays busy until provisioning finishes — open its log for the `ssh -i ...` line. A CT that has booted since it was built is refused (see below) |
-| Stop / Shutdown | rootfs clobbered (`CLOBBER`), CT replaced by a freshly built, never-booted stub |
-| Restart | stop phases, then start phases: clobber, fresh stub, boot, provision (test it on your PVE build) |
+| Stop / Shutdown | the post-stop hook hands the park to a transient systemd unit, `ai-sandbox-park-<agent>-<CTID>`, and the Stop task ends. About a minute later that unit has clobbered the rootfs (`CLOBBER`) and replaced the CT with a freshly built, never-booted stub. Progress: `journalctl -u ai-sandbox-park-<agent>-<CTID>`; `status <agent>` shows it too |
+| Restart | **not supported**: its Start half arrives while the park is still running and is refused. Use Stop, wait for the park (about a minute), then Start |
 | Snapshot / Clone / Migrate / Backup / Console | **not trappable** (no hook phase) — harmless, since the next Start purges everything |
 
 The hook runs without your shell's environment: it finds the agent from
@@ -494,13 +496,17 @@ hook passes through with a one-line notice. When the GUI triggers it,
 the hook takes the lock and does the work. Locks are per agent, so one
 agent's build never makes another agent's hook pass through.
 
-Why Start does not rebuild: Proxmox holds the CT's config lock
-(`/run/lock/lxc/pve-config-<CTID>.lock`) for the whole Start task,
-including the pre-start **and post-start** hooks, so the hooks cannot
-destroy, recreate, or `pct push` into the CT — each would wait on its own
-task and time out. (Provisioning therefore copies files in through
-`pct exec`, which does not take that lock.) The rebuild therefore
-happens at Stop: every Stop / `down` leaves a freshly built stub and
+Why no hook rebuilds the CT: Proxmox holds the CT's config lock
+(`/run/lock/lxc/pve-config-<CTID>.lock`) for the whole Start *and* Stop
+tasks, every hookscript phase included, and `pct status` still reports
+the CT as running during post-stop. Any `pct stop`, `destroy`, `create`,
+`set` or `push` from a hook waits on its own task and times out.
+(Provisioning therefore copies files in through `pct exec`, which does
+not take that lock.) So post-stop only schedules the park with
+`systemd-run` (a plain background job would be killed with the
+container's cgroup); the park job takes the agent's lock, waits until
+`pve-container@<CTID>` is inactive, and leaves the CT alone if it has
+been started again by then. Every Stop / `down` leaves a freshly built stub and
 records that it has never booted (`/root/.ai-sandbox/<agent>/pristine-stub`).
 Start only boots a stub carrying that record and clears it as it boots.
 Anything else — a CT that ran and was never parked (host crash, `pct
@@ -744,6 +750,17 @@ PVE hookscript.)
 - GUI Start fails with `can't lock file '/run/lock/lxc/pve-config-<id>.lock'`
   — another task on that CT is still running (a second click, say).
   Wait for it to finish, then try once.
+- `pre-start: CT <id> is still being parked after the last Stop` — the
+  park job from the last GUI Stop is still running (about a minute).
+  Wait, then Start again; follow it with
+  `journalctl -u ai-sandbox-park-<agent>-<CTID>`. GUI **Restart** always
+  hits this: use Stop, then Start. `up` and `down` give the same advice
+  while the job holds the agent's lock.
+- A GUI Stop ends `OK` but a second `CT <id> - Stop` task fails with
+  `can't lock file ... pve-config-<id>.lock`, and the next Start says
+  `not a fresh stub` — a script from before the deferred park: post-stop
+  tried to park inside the Stop task. Update the script, then run
+  `down <agent>` (or `up <agent>`) once.
 - `self-check: could not fetch/validate ...` (warning, build continues) —
   the self-update check could not reach `RAW_URL`; harmless offline.
 - GUI console refuses every login, or ssh asks for a password — by
@@ -794,10 +811,11 @@ Mistral-specific:
 ## Tests
 
 `tests/run-tests.sh` dry-runs the script against mock `pct`, `pveam`,
-`pvesm`, and `vzdump` commands: argument handling, config precedence and
-safety, a full `up`, the ownership guard, the GUI hook path, `down`,
-`export`, and two agents running in parallel. It needs root, bash,
-python3, and `ssh-keygen`, and refuses to run on a real Proxmox host:
+`pvesm`, `vzdump`, `systemd-run`, and `systemctl` commands: argument
+handling, config precedence and safety, a full `up`, the ownership guard,
+the GUI hook path (including GUI Stop's deferred park), `down`, `export`,
+and two agents running in parallel. It needs root, bash, python3, and
+`ssh-keygen`, and refuses to run on a real Proxmox host:
 
 ```bash
 sudo bash tests/run-tests.sh
