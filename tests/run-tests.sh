@@ -201,6 +201,35 @@ wait "$holder"
 out="$(run "$S" status 2>&1)"
 check "status (all) lists both" grep -q '^mistral ' <<<"$out" && grep -q '^fake ' <<<"$out"
 
+echo "== tidy-up: ssh, usage, self-update in a git checkout, hook output, apt"
+fresh
+out="$(run "$S" ssh mistral 2>&1)"
+check "ssh refuses when the sandbox is not running" grep -q 'mistral sandbox not running' <<<"$out"
+run "$S" up mistral >/dev/null 2>&1
+check "up prints the ssh shortcut" bash -c "grep -q 'or on this host: .* ssh mistral' <<<\"\$(cat)\"" < <(run "$S" up mistral 2>&1)
+: > "$T/calls.log"
+run "$S" ssh mistral uname -a >/dev/null 2>&1
+check "ssh <agent> uses the managed key, accept-new, and passes the command" grep -qx "ssh -i $T/state/ssh/ai-sandbox -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new root@192.168.3.77 uname -a" "$T/calls.log"
+: > "$T/calls.log"
+run AGENT=mistral "$S" ssh >/dev/null 2>&1
+check "ssh takes the agent from AGENT= too" grep -qx "ssh -i $T/state/ssh/ai-sandbox -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new root@192.168.3.77" "$T/calls.log"
+out="$(run "$S" 2>&1)"
+check "usage starts with the description, no shebang or rule lines" bash -c "head -n1 <<<\"\$1\" | grep -q '^ai-sandbox.sh ' && ! grep -qE '^#!|====' <<<\"\$1\"" _ "$out"
+check "usage lists ssh" grep -q '^  ssh     <agent>' <<<"$out"
+check "provision script disables dpkg progress lines" grep -q 'Dpkg::Use-Pty=0' "$T/ct/1051/root/provision-base.sh"
+out="$(run FORCE=1 RESCUE=0 "$S" hook 1051 post-start 2>/dev/null)"
+check "hook sends warnings to stdout, in order (PVE task log)" grep -q 'Datacenter firewall is disabled' <<<"$out"
+# outside a checkout the self-check tries the network; inside one it must not
+out="$(run AUTO_UPDATE=on RAW_URL=http://127.0.0.1:9/none FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "self-check outside a checkout tries RAW_URL" grep -q 'self-check: could not fetch' <<<"$out"
+mkdir "$T/.git"
+out="$(run AUTO_UPDATE=on RAW_URL=http://127.0.0.1:9/none FORCE=1 RESCUE=0 "$S" up mistral 2>&1)"
+check "self-check inside a git checkout is skipped" grep -q "self-check: skipped - running from the git checkout at $T" <<<"$out"
+check "  ...without touching the network" bash -c "! grep -q 'could not fetch' <<<\"\$1\"" _ "$out"
+out="$(run "$S" update 2>&1)"; rc=$?
+check "update refuses in a git checkout, pointing at git pull" [ $rc -ne 0 ] && grep -q 'git -C .* pull' <<<"$out"
+rm -rf "$T/.git"
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]
