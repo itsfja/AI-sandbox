@@ -150,6 +150,7 @@ check "GUI post-start under the PVE lock provisions + reports" [ $rc -eq 0 ] && 
 [ $rc -eq 0 ] || echo "$out" | tail -5
 check "  ...provision script, credentials-free policy file in place" [ -f "$T/ct/1051/root/provision-base.sh" ] && [ -f "$T/ct/1051/root/.vibe/config.toml" ]
 check "  ...without pct push (it needs the lock)" bash -c "! grep -q '^pct push ' '$T/calls.log'"
+check "  ...provisioning runs in a clean env with HOME=/root (PVE hooks have none)" grep -qE '^pct exec 1051 -- env -i HOME=/root .*PATH=/root/.local/bin:[^ ]* bash /root/provision-base.sh$' "$T/calls.log"
 check "  ...hook output is ASCII-only (PVE task log mangles UTF-8)" bash -c "! LC_ALL=C grep -q '[^ -~]' <<<\"\$1\"" _ "$out"
 rm -f "$T/locked/1051"
 # a used (booted) CT must not be started again from the GUI

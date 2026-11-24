@@ -362,6 +362,16 @@ shared_setup() {
   exec 8>&-
 }
 
+# Run a command inside the CT with a fixed, clean root environment.
+# `pct exec` (lxc-attach) passes the CALLER's environment into the CT:
+# from a shell that is your HOME/LANG/exported overrides, from a PVE
+# hookscript it is almost nothing (no HOME - the Vibe installer dies on
+# that under set -u). Either way builds would differ by how they were
+# started; env -i makes CLI `up` and GUI Start provision identically.
+CT_ENV=(env -i HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TERM=dumb
+  LANG=C.UTF-8 PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
+ct_run() { pct exec "$CTID" -- "${CT_ENV[@]}" "$@"; }
+
 # Copy a host file into the CT as root:root with the given mode, creating
 # the destination directory. Streams the file through `pct exec` (stdin)
 # rather than `pct push`: push takes the CT's config lock, which Proxmox
@@ -370,7 +380,7 @@ shared_setup() {
 # The file is created under umask 077 and only then given its final mode,
 # so a secret is never briefly world-readable.
 ct_push_file() {   # $1 = host src, $2 = CT dest path, $3 = octal mode
-  pct exec "$CTID" -- sh -c 'umask 077 && mkdir -p "$(dirname "$1")" && cat > "$1" && chown root:root "$1" && chmod "$2" "$1"' \
+  ct_run sh -c 'umask 077 && mkdir -p "$(dirname "$1")" && cat > "$1" && chown root:root "$1" && chmod "$2" "$1"' \
     sh "$2" "$3" < "$1"
 }
 
@@ -421,7 +431,7 @@ wait_for_ip() {
 
 sandbox_work_findings() {   # echoes findings for a running CT; empty = clean
   ct_running || return 0
-  pct exec "$CTID" -- bash -c '
+  ct_run bash -c '
     command -v git >/dev/null 2>&1 || exit 0
     find /root /home -maxdepth 4 -type d -name .git 2>/dev/null |
     while IFS= read -r g; do
@@ -920,15 +930,10 @@ provision_script() {
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-# headless-clean locale for apt/perl: the host's LANG leaks into the CT
-# through pct exec (lxc-attach passes the calling environment) and is
-# usually not compiled into the fresh CT, so apt/perl would spam
-# warnings; use C here
+# runs under ct_run's clean environment (HOME=/root, LANG=C.UTF-8, PATH
+# with /root/.local/bin first, where uv-style installers put CLIs);
+# C locale keeps apt/perl quiet in a fresh CT
 export LC_ALL=C
-# user-level installers (uv, the native Claude/other installers) put CLIs
-# in /root/.local/bin, which is NOT on the PATH of the pct-exec context —
-# some installers treat that as fatal, and the verify step would fail the
-# same way — so put it up front
 export PATH="/root/.local/bin:$PATH"
 
 # general-purpose baseline: the agent extends this at runtime as needed
@@ -938,10 +943,6 @@ apt-get install -y -qq --no-install-recommends \
   python3 python3-pip python3-venv \
   unzip zip jq ripgrep man-db sudo locales || true
 
-# generate the locale that leaked in from the host (now that the
-# `locales` package is installed): subsequent pct exec calls stop
-# warning and the CT matches the host, whatever LANG says
-[ -n "${LANG:-}" ] && locale-gen "$LANG" >/dev/null 2>&1 || true
 
 # root access is by the injected keypair ONLY: the template ships root's
 # password locked and the script never sets one; pin key-only root login
@@ -982,7 +983,7 @@ provision_and_report() {
   prov="$(mktemp)"
   provision_script > "$prov"
   ct_push_file "$prov" /root/provision-base.sh 700
-  pct exec "$CTID" -- bash /root/provision-base.sh
+  ct_run bash /root/provision-base.sh
   rm -f "$prov"
 
   # permanent credential store -> fresh CT, every build
@@ -996,7 +997,7 @@ provision_and_report() {
     [ -f "$hook" ] || continue
     echo "running user provisioning hook $hook ..."
     ct_push_file "$hook" /root/provision.sh 700
-    pct exec "$CTID" -- bash /root/provision.sh
+    ct_run bash /root/provision.sh
   done
 }
 
