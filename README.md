@@ -89,6 +89,8 @@ See [Roadmap](#roadmap) for what is coming and the design decisions behind it.
 ## Quick start (step by step)
 
 Every command below runs in a root shell on the Proxmox VE host itself.
+(To run the lifecycle from a Windows desktop instead, set this up once and
+then see [Driving it from your desktop](#driving-it-from-your-desktop-restricted-key).)
 The examples use the `mistral` agent; `/root/ai-sandbox.sh agents`
 lists every agent this copy of the script knows.
 
@@ -513,6 +515,74 @@ checkout, that is whatever branch is checked out. A weekly bake fails,
 changing nothing, when both golden slots are busy: a sandbox has been
 running from the older golden since two bakes ago. Rebuild it (`up`, or
 GUI Stop) and the next run succeeds; `timer` shows the failure meanwhile.
+
+## Driving it from your desktop (restricted key)
+
+Everything above runs in a root shell on the Proxmox host. From a Windows
+desktop, `ai-sandbox.ps1` runs the same lifecycle remotely without holding a
+root shell there. It talks to `ai-sandbox-remote.sh`, a small dispatcher
+beside `ai-sandbox.sh` that a dedicated desktop key is pinned to:
+
+```text
+desktop: .\ai-sandbox.ps1 up deepseek
+   └─ ssh -i ~\.ssh\ai-sandbox-pve root@pve "up deepseek"
+        └─ authorized_keys: restrict,pty,command="/root/ai-sandbox-remote.sh --remote"
+             └─ checks the verb and agent, then runs: /root/ai-sandbox.sh up deepseek
+```
+
+Once, from a clone of this repo on the desktop (it uses your normal root
+login one time, then never again):
+
+```powershell
+.\ai-sandbox.ps1 init -PveHost root@192.168.3.188
+```
+
+`init` creates `~\.ssh\ai-sandbox-pve` (set a passphrase if you like),
+installs `ai-sandbox-remote.sh` on the host, installs `ai-sandbox.sh` only
+if the host has none, adds the key to root's `authorized_keys` with the
+forced command, and saves the host in `%USERPROFILE%\.ai-sandbox\desktop.env`.
+After that, for example for Claude Code on DeepSeek:
+
+```powershell
+.\ai-sandbox.ps1 profile examples\profiles\deepseek.sh   # needs REMOTE_PROFILES=on (below)
+.\ai-sandbox.ps1 secret deepseek                         # asks for DEEPSEEK_API_KEY, hidden
+.\ai-sandbox.ps1 up deepseek -Code                       # build, then VS Code inside it
+.\ai-sandbox.ps1 ssh deepseek                            # or a terminal inside it
+.\ai-sandbox.ps1 down deepseek
+```
+
+| Desktop command | What runs on the host |
+| --- | --- |
+| `agents`, `status [agent]` | `ai-sandbox.sh agents` / `status` |
+| `up` / `down` / `reset <agent>` | the same, over an interactive session, so the work guard can still ask before it destroys unpushed work |
+| `secret <agent> [-Name VAR]` | sets `VAR` (default: the agent's key name, see [Agents](#agents)) in `<agent>/secrets.env`, mode 600. The value is typed hidden and sent on stdin, so it never appears on a command line, in history or in the host's log |
+| `profile <file.sh>` | installs a drop-in profile, checked by `ai-sandbox.sh` and rolled back if refused |
+| `connect <agent> [folder]`, `ssh <agent>` | asks the host for the sandbox IP (and, once, the sandbox key), updates the `ai-sandbox-<agent>` block in `~\.ssh\config` (the same block `vscode-connect.ps1` manages), then opens VS Code or ssh |
+
+What the desktop key can and cannot do:
+
+- It can run only the verbs above, on agents `ai-sandbox.sh` knows.
+  Everything else (`purge`, `shell`, `bake`, `update`, a plain shell, port
+  forwarding) is refused. The client's words are split, never evaluated by a
+  shell, and every call is logged to syslog (tag `ai-sandbox-remote`)
+  without secret values or profile bodies.
+- It can read the sandbox SSH key (`key`), which opens the sandboxes and
+  nothing else.
+- **Profile upload is off by default.** A drop-in profile runs as root on
+  the host, so allowing it makes the desktop key as powerful as root. Turn it
+  on only if you accept that, with `REMOTE_PROFILES=on` in
+  `/root/.ai-sandbox/config.env`; otherwise copy profiles on the host as
+  shown in [Writing a profile](#writing-a-profile).
+- Treat the desktop key like any other credential: give it a passphrase,
+  and revoke it on the host with `/root/ai-sandbox-remote.sh remove-keys`
+  (`list-keys` shows what is installed). `init` refuses to restrict a key
+  that already has full root access, so your own admin key is never cut off.
+
+Settings: `-PveHost` beats `desktop.env`, which beats `$env:PVE_HOST`;
+`desktop.env` also holds `PVE_KEY` (the desktop key) and `PVE_DIR` (where
+the scripts live on the host, default `/root`). A Linux/macOS version of the
+desktop command is not written yet; there, use `ssh -i <key> root@pve <verb>`
+against the same dispatcher.
 
 ## From your desktop (export)
 
@@ -1052,6 +1122,10 @@ Work is tracked as PTFs (fixes delivered as PRs):
 5. **PTF 5 — drop-in profiles** *(done)*: any other agent as
    `/root/.ai-sandbox/profiles/<agent>.sh`, checked before it is
    sourced; Codex CLI and Claude Code on DeepSeek as shipped examples.
+6. **PTF 6 — desktop control** *(this release)*: `ai-sandbox.ps1` drives
+   `up`/`down`/`status`, secrets and drop-in profiles from a Windows desktop
+   through `ai-sandbox-remote.sh`, a restricted-key dispatcher on the host
+   (see [Driving it from your desktop](#driving-it-from-your-desktop-restricted-key)).
 
 Decisions so far: parallel instances (one CT per agent from a shared
 golden template); both API keys and subscription tokens supported where

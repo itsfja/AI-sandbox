@@ -105,7 +105,8 @@ $MarkEnd
 
 $conf = ''
 if (Test-Path $ConfigFile) { $conf = Get-Content -Raw $ConfigFile }
-$conf = [regex]::Replace($conf, '(?s)' + [regex]::Escape($MarkBegin) + '.*?' + [regex]::Escape($MarkEnd) + '\r?\n?', '')
+# (any managed block for this alias: ours, or the one ai-sandbox.ps1 writes)
+$conf = [regex]::Replace($conf, '(?s)# BEGIN ' + [regex]::Escape($SshAlias) + ' \(managed by [^)]*\).*?' + [regex]::Escape($MarkEnd) + '\r?\n?', '')
 $conf = [regex]::Replace($conf, '(?ms)^Host ' + [regex]::Escape($SshAlias) + '[ \t]*\r?\n.*?(?=^(?:Host|Match)[ \t]|\z)', '')
 if ([string]::IsNullOrWhiteSpace($conf)) { $conf = $block } else { $conf = $conf.TrimEnd("`r", "`n") + "`r`n" + $block }
 Set-Content -Path $ConfigFile -Value $conf -Encoding Ascii
