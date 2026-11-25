@@ -18,7 +18,7 @@ jobs:
         # the PVE hook shim execs ai-sandbox.sh directly from a clone
         run: |
           bad=0
-          for f in ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/*; do
+          for f in ai-sandbox.sh ai-sandbox-remote.sh vscode-connect.sh tests/run-tests.sh tests/run-remote-tests.sh tests/mock/bin/*; do
             mode="$(git ls-files -s -- "$f" | cut -d' ' -f1)"
             [ "$mode" = 100755 ] || { echo "::error file=$f::mode $mode, expected 100755 (git update-index --chmod=+x $f)"; bad=1; }
           done
@@ -27,13 +27,33 @@ jobs:
       - name: Syntax check
         run: |
           bash -n ai-sandbox.sh
+          bash -n ai-sandbox-remote.sh
           bash -n vscode-connect.sh
           bash -n tests/run-tests.sh
+          bash -n tests/run-remote-tests.sh
           for f in examples/profiles/*.sh; do bash -n "$f"; done
 
       - name: ShellCheck
-        run: shellcheck -S warning ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/* examples/profiles/*.sh
+        run: shellcheck -S warning ai-sandbox.sh ai-sandbox-remote.sh vscode-connect.sh tests/run-tests.sh tests/run-remote-tests.sh tests/mock/bin/* examples/profiles/*.sh
 
       - name: Dry-run tests (mock Proxmox)
         # needs root for /run/lock and ssh-keygen; refuses to run where /etc/pve exists
         run: sudo bash tests/run-tests.sh
+
+      - name: Restricted-key dispatcher tests
+        # as a normal user: the dispatcher drives a stub ai-sandbox.sh in a temp dir
+        run: bash tests/run-remote-tests.sh
+
+      - name: PowerShell scripts parse and pass PSScriptAnalyzer (errors)
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem -Filter *.ps1) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            foreach ($e in $errs) { Write-Output "::error file=$($f.Name)::$($e.Message)"; $bad = 1 }
+          }
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) { Install-Module PSScriptAnalyzer -Force -Scope CurrentUser }
+          $r = Get-ChildItem -Filter *.ps1 | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Severity Error }
+          foreach ($x in $r) { Write-Output "::error file=$($x.ScriptName),line=$($x.Line)::$($x.RuleName): $($x.Message)"; $bad = 1 }
+          exit $bad
