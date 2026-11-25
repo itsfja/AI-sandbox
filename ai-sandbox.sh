@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 # ai-sandbox.sh — single-use, rebuild-on-demand LXC sandboxes for AI coding
-#                 agents on Proxmox VE (Mistral Vibe, Claude Code and Gemini
-#                 CLI today; drop-in profiles to follow)
+#                 agents on Proxmox VE (Mistral Vibe, Claude Code, Gemini CLI,
+#                 and any other agent as a drop-in profile)
 #
 # Usage:  ai-sandbox.sh <command> [agent]        (or AGENT=<agent> in env)
 #
@@ -65,8 +65,18 @@ set -euo pipefail
 
 # --------------------------- agent & instance --------------------------------
 STATE_DIR="${STATE_DIR:-/root/.ai-sandbox}"
+PROFILES_DIR="${STATE_DIR}/profiles"   # drop-in agent profiles: <agent>.sh
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# Files this script reads (config.env) or sources (drop-in profiles) run with
+# root's authority, so only root may be able to change them.
+require_root_safe() {   # $1 = path
+  [ "$(stat -c %u "$1")" = "0" ] || die "refusing $1: not owned by root"
+  case "$(stat -c %a "$1")" in
+    *[2367]?|*?[2367]) die "refusing $1: group/other-writable" ;;
+  esac
+}
 
 # Read KEY=value lines from a config file WITHOUT executing it. A key already
 # set in the environment wins, so command-line overrides beat the file; the
@@ -74,10 +84,7 @@ die() { echo "error: $*" >&2; exit 1; }
 load_config_file() {   # $1 = path
   local file="$1" line key val
   [ -f "$file" ] || return 0
-  [ "$(stat -c %u "$file")" = "0" ] || die "refusing $file: not owned by root"
-  case "$(stat -c %a "$file")" in
-    *[2367]?|*?[2367]) die "refusing $file: group/other-writable" ;;
-  esac
+  require_root_safe "$file"
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%$'\r'}"
     case "$line" in ''|'#'*) continue ;; esac
@@ -116,6 +123,75 @@ select_agent() {   # $1 = agent (may be empty: falls back to $AGENT)
 
 list_profiles() {
   declare -F | awk '{print $3}' | sed -n 's/^profile_\([a-z][a-z0-9]*\)_meta$/\1/p' | paste -sd' ' -
+}
+
+# --------------------------- drop-in profiles (#12) --------------------------
+# $PROFILES_DIR/<agent>.sh adds an agent without editing this script. It is
+# SOURCED as root on every run (hooks included), so it is held to more than
+# config.env: the directory and file root-owned and not group/other-
+# writable, no symlinks, a valid unused agent name, every required part,
+# a CTID no other profile uses, and it may only ADD functions named
+# profile_<agent>_*: one that redefines any existing function (a built-in
+# profile's, or the script's own, e.g. guard_ct) or changes the script's
+# paths is refused, and with it the whole run (fail closed).
+DROPIN_GUARDED_VARS=(STATE_DIR PROFILES_DIR FW_DIR PVE_LXC_DIR SYSTEMD_UNIT_DIR SANDBOX_TAG HOOK_VOL_ID HOOK_SNIPPET_DIR PATH)
+PROFILE_PARTS=(meta install verify credentials policy credential_paths)
+
+load_dropin_profiles() {
+  local dir="$PROFILES_DIR" f name fns dump_before dump_after vars_before fn part bad=""
+  [ -e "$dir" ] || return 0
+  [ ! -L "$dir" ] || die "refusing drop-in profiles: $dir is a symlink"
+  [ -d "$dir" ] || die "refusing drop-in profiles: $dir is not a directory"
+  require_root_safe "$dir"
+  for f in "$dir"/*.sh; do
+    [ -e "$f" ] || continue
+    name="${f##*/}"
+    name="${name%.sh}"
+    [ ! -L "$f" ] || die "refusing drop-in profile $f: a symlink"
+    [ -f "$f" ] || die "refusing drop-in profile $f: not a regular file"
+    require_root_safe "$f"
+    { valid_agent_name "$name" && [ "$name" != golden ]; } \
+      || die "refusing drop-in profile $f: '$name' is not a valid agent name (a lowercase letter, then up to 15 lowercase letters or digits; 'golden' is reserved)"
+    ! declare -F "profile_${name}_meta" >/dev/null \
+      || die "refusing drop-in profile $f: agent '$name' already exists (built-in)"
+    read -r -a fns <<<"$(declare -F | awk '{print $3}' | paste -sd' ' -)"
+    dump_before="$(declare -f "${fns[@]}")"
+    vars_before="$(for v in "${DROPIN_GUARDED_VARS[@]}"; do printf '%s=%s\n' "$v" "${!v-}"; done)"
+    # shellcheck source=/dev/null
+    source "$f"
+    dump_after="$(declare -f "${fns[@]}")"
+    if [ "$dump_after" != "$dump_before" ]; then
+      for fn in "${fns[@]}"; do
+        [ "$(declare -f "$fn")" = "$(sed -n "/^$fn () $/,/^}$/p" <<<"$dump_before")" ] || bad="$bad $fn"
+      done
+      die "refusing drop-in profile $f: it redefines existing function(s):${bad:- (unknown)}"
+    fi
+    [ "$(for v in "${DROPIN_GUARDED_VARS[@]}"; do printf '%s=%s\n' "$v" "${!v-}"; done)" = "$vars_before" ] \
+      || die "refusing drop-in profile $f: it changes the script's own settings (one of ${DROPIN_GUARDED_VARS[*]})"
+    for fn in $(declare -F | awk '{print $3}'); do
+      [[ " ${fns[*]} " == *" $fn "* ]] && continue
+      [[ "$fn" == "profile_${name}_"* ]] \
+        || die "refusing drop-in profile $f: it defines '$fn'; a drop-in may only define profile_${name}_* functions"
+    done
+    for part in "${PROFILE_PARTS[@]}"; do
+      declare -F "profile_${name}_${part}" >/dev/null \
+        || die "refusing drop-in profile $f: no profile_${name}_${part} (required: ${PROFILE_PARTS[*]})"
+    done
+  done
+  check_profile_ctids
+}
+
+# Two agents on one CTID would fight over a container; refuse up front.
+check_profile_ctids() {
+  local a id seen=" " owner
+  for a in $(list_profiles); do
+    id="$( "profile_${a}_meta"; echo "${PROFILE_CTID:-}" )"
+    [[ "$id" =~ ^[0-9]+$ ]] && [ "$id" -ge 100 ] \
+      || die "profile '$a': PROFILE_CTID '${id}' is not a CT ID (100 or more)"
+    owner="$(sed -n "s/.* $id=\([a-z0-9]*\) .*/\1/p" <<<"$seen")"
+    [ -z "$owner" ] || die "profiles '$owner' and '$a' both use CT $id; give one a different PROFILE_CTID"
+    seen="$seen$id=$a "
+  done
 }
 
 # --------------------------- configuration ---------------------------------
@@ -2321,6 +2397,8 @@ cmd_update() {
 }
 
 # --------------------------- dispatch ---------------------------------------
+load_dropin_profiles
+
 cmd="${1:-}"
 [ $# -gt 0 ] && shift
 case "$cmd" in

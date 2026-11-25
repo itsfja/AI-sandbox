@@ -29,9 +29,10 @@ jobs:
           bash -n ai-sandbox.sh
           bash -n vscode-connect.sh
           bash -n tests/run-tests.sh
+          for f in examples/profiles/*.sh; do bash -n "$f"; done
 
       - name: ShellCheck
-        run: shellcheck -S warning ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/*
+        run: shellcheck -S warning ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/* examples/profiles/*.sh
 
       - name: Dry-run tests (mock Proxmox)
         # needs root for /run/lock and ssh-keygen; refuses to run where /etc/pve exists
