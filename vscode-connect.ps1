@@ -71,14 +71,26 @@ if (Probe) { Launch }
 # --- stale path: refresh from the host ---------------------------------
 Note "ssh $SshAlias failed (stale IP after a rebuild?), refreshing from $PveHost ..."
 
-$newIp = (ssh $PveHost "$PveScript ip $Agent" | Select-Object -First 1)
+# ai-sandbox.ps1's desktop key (~\.ssh\ai-sandbox-pve) is pinned to the
+# host's restricted dispatcher. If it is loaded in ssh-agent, ssh would offer
+# it first and this root login would land in the dispatcher, so then use
+# only identity files (or a password) for the host.
+$PveOpts = @()
+$pinnedPub = Join-Path $SshDir 'ai-sandbox-pve.pub'
+if (Test-Path $pinnedPub) {
+  $blob = ((Get-Content $pinnedPub | Select-Object -First 1) -split ' ')[1]
+  $loaded = ssh-add -L 2>$null
+  if ($blob -and ($loaded | Where-Object { $_ -like "* $blob*" })) { $PveOpts = @('-o', 'IdentitiesOnly=yes') }
+}
+
+$newIp = (ssh @PveOpts $PveHost "$PveScript ip $Agent" | Select-Object -First 1)
 if ($LASTEXITCODE -ne 0) { Die "could not reach the Proxmox host at $PveHost" }
 if (-not $newIp) { Die "the $Agent sandbox is not running (no IP). Run '$PveScript up $Agent' on the Proxmox host first." }
 Note "current sandbox IP: $newIp"
 
 New-Item -ItemType Directory -Force -Path $SshDir | Out-Null
 if (-not (Test-Path $KeyFile)) {
-  scp -q "${PveHost}:$PveKey" $KeyFile
+  scp -q @PveOpts "${PveHost}:$PveKey" $KeyFile
   if ($LASTEXITCODE -ne 0) { Die "could not fetch the sandbox key from ${PveHost}:$PveKey" }
   # private key readable by this user only (Windows OpenSSH checks ACLs)
   icacls $KeyFile /inheritance:r 2>$null | Out-Null
@@ -104,12 +116,13 @@ $MarkEnd
 "@
 
 $conf = ''
-if (Test-Path $ConfigFile) { $conf = Get-Content -Raw $ConfigFile }
+if (Test-Path $ConfigFile) { $conf = [IO.File]::ReadAllText($ConfigFile) }
 # (any managed block for this alias: ours, or the one ai-sandbox.ps1 writes)
 $conf = [regex]::Replace($conf, '(?s)# BEGIN ' + [regex]::Escape($SshAlias) + ' \(managed by [^)]*\).*?' + [regex]::Escape($MarkEnd) + '\r?\n?', '')
 $conf = [regex]::Replace($conf, '(?ms)^Host ' + [regex]::Escape($SshAlias) + '[ \t]*\r?\n.*?(?=^(?:Host|Match)[ \t]|\z)', '')
 if ([string]::IsNullOrWhiteSpace($conf)) { $conf = $block } else { $conf = $conf.TrimEnd("`r", "`n") + "`r`n" + $block }
-Set-Content -Path $ConfigFile -Value $conf -Encoding Ascii
+# UTF-8 without a BOM: other entries keep every character (ASCII would turn them into '?')
+[IO.File]::WriteAllText($ConfigFile, $conf, (New-Object Text.UTF8Encoding $false))
 Note "ssh config updated: Host $SshAlias -> $newIp (only the managed block was touched)."
 
 # A just-started sandbox may still be finishing provisioning; wait a bit.

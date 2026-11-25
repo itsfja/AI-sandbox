@@ -20,7 +20,7 @@
 #   status [agent]            one agent, or every ai-sandbox CT
 #   ip     <agent>            current sandbox IP
 #   up|down|reset <agent>     the ai-sandbox.sh lifecycle (work guard intact)
-#   key                       print the sandbox SSH private key (the one that
+#   key [agent]               print the sandbox SSH private key (the one that
 #                             opens every sandbox, and nothing else)
 #   secret <agent> <NAME>     set NAME=<one line on stdin> in the agent's
 #                             secrets.env (mode 600); the value is never
@@ -67,7 +67,7 @@ usage_remote() {
   cat <<'EOF'
 ai-sandbox-remote verbs:
   agents | status [agent] | ip <agent> | up <agent> | down <agent> | reset <agent>
-  key | secret <agent> <NAME> (value on stdin) | profile <agent> (base64 on stdin) | help
+  key [agent] | secret <agent> <NAME> (value on stdin) | profile <agent> (base64 on stdin) | help
 EOF
 }
 
@@ -80,26 +80,83 @@ need_agent() {   # $1 = agent
   known_agent "$1" || die "unknown agent '${1:-}'; run 'agents' to list them"
 }
 
-config_on() {   # $1 = KEY; rc 0 when $STATE_DIR/config.env has KEY=on
-  local f="${STATE_DIR}/config.env"
-  [ -f "$f" ] || return 1
-  # same trust rule as ai-sandbox.sh: only root (the user this runs as) may
-  # be able to change it
-  [ "$(stat -c %u "$f")" = "$(id -u)" ] || return 1
-  case "$(stat -c %a "$f")" in *[2367]? | *?[2367]) return 1 ;; esac
-  grep -Eq "^[[:space:]]*$1=[\"']?on[\"']?[[:space:]]*\$" "$f"
+# grep, but only "no line matched" (rc 1) is fine: a read or write error
+# (rc 2, e.g. a full /tmp) must never pass for an empty result, because the
+# callers write that result over a real file.
+grep_ok() {
+  local rc=0
+  grep "$@" || rc=$?
+  [ "$rc" -le 1 ]
+}
+
+# Read one setting the way ai-sandbox.sh's load_config_file does: from
+# <agent>/config.env first, then config.env; within a file the first line
+# wins; one pair of surrounding quotes is stripped; nothing is executed.
+# A config file only root (the user this runs as) can change is required,
+# as there: an untrusted one stops the run instead of being ignored.
+config_value() {   # $1 = KEY, $2 = optional agent; prints the value (may be empty)
+  local key="$1" agent="${2:-}" f line val
+  for f in ${agent:+"${STATE_DIR}/${agent}/config.env"} "${STATE_DIR}/config.env"; do
+    [ -f "$f" ] || continue
+    [ "$(stat -c %u "$f")" = "$(id -u)" ] || die "refusing $f: not owned by $(id -un)"
+    case "$(stat -c %a "$f")" in *[2367]? | *?[2367]) die "refusing $f: group/other-writable" ;; esac
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?${key}=(.*)$ ]] || continue
+      val="${BASH_REMATCH[2]}"
+      if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+      printf '%s' "$val"
+      return 0
+    done < "$f"
+  done
+  return 0
+}
+
+config_on() {   # $1 = KEY; rc 0 when config.env sets KEY=on
+  [ "$(config_value "$1")" = on ]
 }
 
 # --------------------------- remote verbs -----------------------------------
 
-remote_key() {
-  local k="${STATE_DIR}/ssh/ai-sandbox"
+# The private key that opens the agent's sandbox: SSH_KEY_FILE as
+# ai-sandbox.sh resolves it. With SSH_PUBKEY set, sandboxes trust a key this
+# host does not manage, so there is nothing to hand out.
+remote_key() {   # $1 = optional agent (its config.env is read first)
+  local agent="${1:-}" k
+  [ -z "$agent" ] || need_agent "$agent"
+  [ -z "$(config_value SSH_PUBKEY "$agent")" ] \
+    || die "this host sets SSH_PUBKEY: sandboxes trust your own key, not a managed one. Put its private half at ~/.ssh/ai-sandbox on the desktop yourself"
+  k="$(config_value SSH_KEY_FILE "$agent")"
+  k="${k:-${STATE_DIR}/ssh/ai-sandbox}"
   [ -f "$k" ] || die "no sandbox keypair yet at $k; run 'up <agent>' once first"
   cat "$k"
 }
 
+# secrets.env for an agent: SECRETS_FILE as ai-sandbox.sh resolves it
+secrets_file_for() {   # $1 = agent
+  local f
+  f="$(config_value SECRETS_FILE "$1")"
+  if [ -n "$f" ]; then
+    [[ "$f" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "SECRETS_FILE '$f' in config.env is not a plain absolute path"
+    [ -d "$(dirname "$f")" ] || die "SECRETS_FILE's folder $(dirname "$f") does not exist; nothing changed"
+    printf '%s' "$f"
+  else
+    printf '%s' "${STATE_DIR}/$1/secrets.env"
+  fi
+}
+
+# Names an agent reads as alternatives, so setting one must drop the other:
+# the claude profile uses ANTHROPIC_API_KEY first when both are present,
+# which would silently keep an old API key after a switch to a token.
+exclusive_names() {   # $1 = agent, $2 = NAME
+  case "$1:$2" in
+    claude:ANTHROPIC_API_KEY) echo CLAUDE_CODE_OAUTH_TOKEN ;;
+    claude:CLAUDE_CODE_OAUTH_TOKEN) echo ANTHROPIC_API_KEY ;;
+  esac
+}
+
 remote_secret() {   # $1 = agent, $2 = NAME; value = first line of stdin
-  local agent="$1" name="$2" val dir file tmp
+  local agent="$1" name="$2" val dir file tmp other drop
   need_agent "$agent"
   [[ "$name" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] || die "invalid secret name '$name' (A-Z, 0-9, _)"
   IFS= read -r val || [ -n "$val" ] || die "no value on stdin"
@@ -111,19 +168,25 @@ remote_secret() {   # $1 = agent, $2 = NAME; value = first line of stdin
   # credentials are tokens: refuse anything that could break a KEY=value
   # line or smuggle shell syntax into a profile that is careless with it
   [[ "$val" =~ ^[A-Za-z0-9_.:/+=@-]+$ ]] || die "value has characters a key never contains; nothing changed"
-  dir="${STATE_DIR}/${agent}"
-  file="${dir}/secrets.env"
+  file="$(secrets_file_for "$agent")"
+  dir="$(dirname "$file")"
   umask 077
   [ -d "$STATE_DIR" ] || install -d -m 700 "$STATE_DIR"
   [ -d "$dir" ] || install -d -m 700 "$dir"
+  other="$(exclusive_names "$agent" "$name")"
+  drop="$name${other:+|$other}"
   tmp="$(mktemp "${dir}/.secrets.XXXXXX")"
+  # the temp file sits beside secrets.env, so the mv is an atomic rename; a
+  # failed read or write leaves secrets.env exactly as it was
   if [ -f "$file" ]; then
-    grep -v -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$file" > "$tmp" || true
+    grep_ok -v -E "^[[:space:]]*(export[[:space:]]+)?(${drop})=" "$file" > "$tmp" \
+      || { rm -f "$tmp"; die "could not read or copy $file; nothing changed"; }
   fi
-  printf '%s=%s\n' "$name" "$val" >> "$tmp"
+  printf '%s=%s\n' "$name" "$val" >> "$tmp" || { rm -f "$tmp"; die "could not write beside $file; nothing changed"; }
   chmod 600 "$tmp"
   mv -f "$tmp" "$file"
   echo "set $name for $agent in $file (mode 600); it reaches the sandbox on the next 'up $agent'"
+  [ -z "$other" ] || echo "($other removed if it was set: $agent uses one or the other)"
 }
 
 remote_profile() {   # $1 = agent; base64 profile body on stdin
@@ -182,8 +245,8 @@ run_remote() {
       need_agent "${w[1]}"
       exec "$SCRIPT" "$verb" "${w[1]}" ;;
     key)
-      [ "$n" -eq 1 ] || die "usage: key"
-      remote_key ;;
+      [ "$n" -le 2 ] || die "usage: key [agent]"
+      remote_key "${w[1]:-}" ;;
     secret)
       [ "$n" -eq 3 ] || die "usage: secret <agent> <NAME>  (value on stdin)"
       remote_secret "${w[1]}" "${w[2]}" ;;
@@ -213,13 +276,53 @@ ensure_auth_keys() {
   ( umask 077; : > "$AUTH_KEYS" )
 }
 
-write_auth_keys() {   # $1 = temp file with the new content (removed after)
-  cat "$1" > "$AUTH_KEYS" || { rm -f "$1"; die "could not write $AUTH_KEYS"; }
-  rm -f "$1"
+# An authorized_keys line this script manages: the forced-command option
+# pointing at an ai-sandbox-remote.sh --remote, a key, and the tag. Matching
+# the option (not the comment alone) keeps a full-root line that merely has
+# the same comment from being treated as restricted.
+restricted_re() {   # $1 = optional key blob (default: any)
+  local b='[A-Za-z0-9+/]+=*'
+  [ -z "${1:-}" ] || b="${1//+/\\+}"
+  printf '^restrict,pty,command="[^"]*ai-sandbox-remote\\.sh --remote" [^ ]+ %s %s$' "$b" "$KEY_TAG"
+}
+
+count_lines() {   # $1 = file; counts a last line without a newline too
+  local n
+  n="$(grep -c '' "$1")" || [ "$n" = 0 ] || return 1
+  printf '%s' "$n"
+}
+
+# Rewrite authorized_keys without ever leaving it shorter than intended.
+# Everything is computed from a snapshot copy first; the new content must
+# have exactly the expected number of lines (so a full /tmp or a read error
+# can never pass for "fewer keys"), and if writing the real file fails the
+# snapshot is written back and kept.
+rewrite_auth_keys() {   # $1 = ERE of lines to drop, $2 = optional line to append
+  local re="$1" add="${2:-}" snap new old drop want got
+  snap="$(mktemp)" && new="$(mktemp)" || die "mktemp failed; $AUTH_KEYS unchanged"
+  if ! cat "$AUTH_KEYS" > "$snap"; then rm -f "$snap" "$new"; die "could not copy $AUTH_KEYS; it is unchanged"; fi
+  old="$(count_lines "$snap")" && drop="$(grep -cE -- "$re" "$snap" || [ $? -eq 1 ])" \
+    || { rm -f "$snap" "$new"; die "could not read the copy of $AUTH_KEYS; it is unchanged"; }
+  drop="${drop:-0}"
+  grep_ok -vE -- "$re" "$snap" > "$new" || { rm -f "$snap" "$new"; die "could not filter $AUTH_KEYS; it is unchanged"; }
+  if [ -n "$add" ]; then
+    printf '%s\n' "$add" >> "$new" || { rm -f "$snap" "$new"; die "could not write a temp file; $AUTH_KEYS unchanged"; }
+  fi
+  want=$((old - drop + (${#add} > 0 ? 1 : 0)))
+  got="$(count_lines "$new")" || got=-1
+  if [ "$got" != "$want" ]; then
+    rm -f "$snap" "$new"
+    die "the new $AUTH_KEYS would have $got lines, expected $want; it is unchanged"
+  fi
+  if ! cat "$new" > "$AUTH_KEYS"; then
+    cat "$snap" > "$AUTH_KEYS" 2>/dev/null || true
+    die "could not write $AUTH_KEYS; the previous content was written back and is also kept at $snap"
+  fi
+  rm -f "$snap" "$new"
 }
 
 install_key() {   # $1 = optional file holding the public key; else stdin
-  local line type blob entry tmp
+  local line type blob entry others
   if [ -n "${1:-}" ]; then IFS= read -r line < "$1" || true; else IFS= read -r line || true; fi
   line="${line%$'\r'}"
   [[ "$line" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+([A-Za-z0-9+/]+=*)([[:space:]].*)?$ ]] \
@@ -227,29 +330,31 @@ install_key() {   # $1 = optional file holding the public key; else stdin
   type="${BASH_REMATCH[1]}"; blob="${BASH_REMATCH[2]}"
   [[ "$SELF" =~ ^[A-Za-z0-9_./-]+$ ]] || die "refusing: this script's path ($SELF) has characters unsafe in authorized_keys"
   ensure_auth_keys
-  # a key that already logs in without the forced command is a full root
-  # key; restricting it here would silently cut off its owner's shell
-  if grep -F -- " $blob" "$AUTH_KEYS" | grep -vq -- " $KEY_TAG\$"; then
-    die "this key already has unrestricted access in $AUTH_KEYS; generate a dedicated key for the desktop (ai-sandbox.ps1 init does)"
+  # a line for this key that is not our restricted entry lets it log in
+  # some other way (a full root shell, or other options); restricting it
+  # here would silently cut that access off
+  others="$(grep_ok -F -- " $blob" "$AUTH_KEYS")" || die "could not read $AUTH_KEYS"
+  if [ -n "$others" ] && grep -vqE -- "$(restricted_re "$blob")" <<<"$others"; then
+    die "this key already has other access in $AUTH_KEYS (e.g. a full root login); generate a dedicated key for the desktop (ai-sandbox.ps1 init does)"
   fi
   entry="restrict,pty,command=\"${SELF} --remote\" ${type} ${blob} ${KEY_TAG}"
-  tmp="$(mktemp)"
-  grep -vF -- " $blob $KEY_TAG" "$AUTH_KEYS" > "$tmp" || true
-  printf '%s\n' "$entry" >> "$tmp"
-  write_auth_keys "$tmp"
+  rewrite_auth_keys "$(restricted_re "$blob")" "$entry"
   echo "restricted key installed in $AUTH_KEYS (${type}, verbs only via $SELF)"
 }
 
-list_keys() { grep -- " $KEY_TAG\$" "$AUTH_KEYS" 2>/dev/null || echo "(no restricted keys)"; }
+list_keys() {
+  local out
+  [ -f "$AUTH_KEYS" ] || { echo "(no authorized_keys)"; return 0; }
+  out="$(grep_ok -E -- "$(restricted_re)" "$AUTH_KEYS")" || die "could not read $AUTH_KEYS"
+  if [ -n "$out" ]; then echo "$out"; else echo "(no restricted keys)"; fi
+}
 
 remove_keys() {
-  local tmp n
+  local n
   [ -f "$AUTH_KEYS" ] || { echo "(no authorized_keys)"; return 0; }
-  n="$(grep -c -- " $KEY_TAG\$" "$AUTH_KEYS" || true)"
-  tmp="$(mktemp)"
-  grep -v -- " $KEY_TAG\$" "$AUTH_KEYS" > "$tmp" || true
-  write_auth_keys "$tmp"
-  echo "removed $n restricted key(s) from $AUTH_KEYS"
+  n="$(grep -cE -- "$(restricted_re)" "$AUTH_KEYS" || [ $? -eq 1 ])" || die "could not read $AUTH_KEYS"
+  rewrite_auth_keys "$(restricted_re)"
+  echo "removed ${n:-0} restricted key(s) from $AUTH_KEYS"
 }
 
 # --------------------------- which ai-sandbox.sh ----------------------------
@@ -284,6 +389,17 @@ link_script() {   # $1 = the ai-sandbox.sh to use
   local real
   real="$(readlink -f "$1")"
   [ "$real" != "$(readlink -f "$SCRIPT" 2>/dev/null || true)" ] || { echo "keeping $SCRIPT (already $real)"; return 0; }
+  # ai-sandbox.sh runs the provision.sh beside its resolved path on every
+  # build. Relinking moves that place, so a provision.sh the current copy
+  # uses would silently stop running: refuse until it is where it will be read.
+  local old_hook new_hook
+  if [ -e "$SCRIPT" ]; then
+    old_hook="$(dirname "$(readlink -f "$SCRIPT")")/provision.sh"
+    new_hook="$(dirname "$real")/provision.sh"
+    if [ -f "$old_hook" ] && ! cmp -s "$old_hook" "$new_hook"; then
+      die "refusing to relink: $old_hook runs on every build today, but after linking ai-sandbox.sh would read $new_hook instead. Copy it there first (cp $old_hook $new_hook), then run this again"
+    fi
+  fi
   if [ -f "$SCRIPT" ] && [ ! -L "$SCRIPT" ]; then
     mv -f "$SCRIPT" "${SCRIPT}.bak"
     echo "moved the standalone copy aside: ${SCRIPT}.bak"

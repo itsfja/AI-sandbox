@@ -89,6 +89,26 @@ function Assert-Ready($s) {
   }
   if (-not $s.PVE_HOST) { Die "no Proxmox host set; run '.\ai-sandbox.ps1 init -PveHost root@<address>' first" }
   if (-not (Test-Path $s.PVE_KEY)) { Die "desktop key $($s.PVE_KEY) not found; run '.\ai-sandbox.ps1 init' first" }
+  if (Test-KeyInAgent $s) {
+    Write-Host ("ai-sandbox: warning: $($s.PVE_KEY) is loaded in ssh-agent. A plain 'ssh $($s.PVE_HOST)' may then log in " +
+      "with it and reach only the sandbox commands, not a shell. Remove it: ssh-add -d `"$($s.PVE_KEY)`"") -ForegroundColor Yellow
+  }
+}
+
+# The desktop key is pinned to the dispatcher on the host. ssh offers
+# ssh-agent's keys before its default identity files, so with this key in
+# the agent a plain `ssh root@<host>` (or vscode-connect.ps1, or init) can
+# log in with it and land in the dispatcher instead of a shell. This script
+# always names the key itself (-i, IdentitiesOnly), so it never needs the
+# agent: $true when it is there (callers warn, or avoid the agent).
+function Test-KeyInAgent($s) {
+  $pubFile = "$($s.PVE_KEY).pub"
+  if (-not (Test-Path $pubFile)) { return $false }
+  $blob = ((Get-Content $pubFile | Select-Object -First 1) -split ' ')[1]
+  if (-not $blob) { return $false }
+  $ErrorActionPreference = 'Continue'
+  $loaded = ssh-add -L 2>$null
+  return [bool]($LASTEXITCODE -eq 0 -and ($loaded | Where-Object { $_ -like "* $blob*" }))
 }
 
 function PveArgs($s, [switch]$Tty) {
@@ -148,7 +168,7 @@ function Update-SandboxEntry($s, [string]$agent) {
   if ($ip -notmatch '^[0-9A-Fa-f:.]+$') { Die "unexpected answer for the $agent IP: $ip" }
   New-Item -ItemType Directory -Force -Path $SshDir | Out-Null
   if (-not (Test-Path $SandboxKey)) {
-    $key = (Get-PveOutput $s 'key') -join "`n"
+    $key = (Get-PveOutput $s "key $agent") -join "`n"
     if ($key -notmatch 'PRIVATE KEY') { Die "the host did not return a private key" }
     [IO.File]::WriteAllText($SandboxKey, $key + "`n")
     Lock-KeyFile $SandboxKey
@@ -169,14 +189,15 @@ Host $alias
 $end
 "@
   $conf = ''
-  if (Test-Path $SshConfig) { $conf = Get-Content -Raw $SshConfig }
+  if (Test-Path $SshConfig) { $conf = [IO.File]::ReadAllText($SshConfig) }
   if ($null -eq $conf) { $conf = '' }
   # drop any managed block for this alias (either script's), and a legacy
   # unmarked 'Host <alias>' block from the manual export flow
   $conf = [regex]::Replace($conf, '(?s)# BEGIN ' + [regex]::Escape($alias) + ' \(managed by [^)]*\).*?# END ' + [regex]::Escape($alias) + '\r?\n?', '')
   $conf = [regex]::Replace($conf, '(?ms)^Host ' + [regex]::Escape($alias) + '[ \t]*\r?\n.*?(?=^(?:Host|Match)[ \t]|\z)', '')
   if ([string]::IsNullOrWhiteSpace($conf)) { $conf = $block } else { $conf = $conf.TrimEnd("`r", "`n") + "`r`n" + $block }
-  Set-Content -Path $SshConfig -Value $conf -Encoding Ascii
+  # UTF-8 without a BOM, so entries outside the managed block keep every character
+  [IO.File]::WriteAllText($SshConfig, $conf, (New-Object Text.UTF8Encoding $false))
   Note "ssh config: Host $alias -> $ip"
   foreach ($i in 1..15) {
     if (Test-SandboxSsh $alias) { return $alias }
@@ -253,7 +274,15 @@ switch ($Command) {
       '# end'
     ) -join $nl
     Note "setting up $($s.PVE_HOST) with your normal login (this once only)"
-    $rc = Invoke-SshWithInput @($s.PVE_HOST, 'bash -s') $setup
+    # This login needs a shell. If the desktop key (already pinned to the
+    # dispatcher by an earlier init) is in ssh-agent, ssh would offer it
+    # first, so then use only your identity files or a password.
+    $loginArgs = @($s.PVE_HOST, 'bash -s')
+    if (Test-KeyInAgent $s) {
+      Note "the desktop key is in ssh-agent; logging in with your identity files or password instead"
+      $loginArgs = @('-o', 'IdentitiesOnly=yes') + $loginArgs
+    }
+    $rc = Invoke-SshWithInput $loginArgs $setup
     if ($rc -ne 0) { Die "host setup failed (output above)" }
     Save-Settings $s
     Note "settings saved to $CfgFile; checking the restricted key ..."
@@ -289,11 +318,13 @@ switch ($Command) {
     if (-not $var) { $var = $SecretNames[$Target] }
     if (-not $var) { Die "no default secret name for '$Target'; pass -Name VAR_NAME" }
     if ($var -cnotmatch '^[A-Z][A-Z0-9_]{0,63}$') { Die "invalid -Name '$var'" }
+    $prompt = $var
+    if ($Target -eq 'claude' -and -not $Name) { $prompt = 'ANTHROPIC_API_KEY or subscription token' }
     if ($FromClipboard) {
       $plain = Get-Clipboard -Raw
     } else {
       Note "paste the key and press Enter; nothing is shown. In the classic PowerShell window, paste with a right-click (Ctrl+V may not paste into a hidden prompt)."
-      $sec = Read-Host -AsSecureString "$var for $Target"
+      $sec = Read-Host -AsSecureString "$prompt for $Target"
       $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
       try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
       finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
@@ -307,6 +338,11 @@ switch ($Command) {
       Die ("that is not a key ($n character(s), or characters a key never contains); nothing changed.`n" +
         "  The paste probably did not go through. Paste with a right-click, or copy the key and run:`n" +
         "  .\ai-sandbox.ps1 secret $Target -FromClipboard")
+    }
+    # a Claude subscription token (claude setup-token) is not an API key
+    if ($Target -eq 'claude' -and -not $Name -and $plain.StartsWith('sk-ant-oat')) {
+      $var = 'CLAUDE_CODE_OAUTH_TOKEN'
+      Note "that is a subscription token: setting CLAUDE_CODE_OAUTH_TOKEN (and dropping ANTHROPIC_API_KEY)"
     }
     # stdin, never argv: the value stays out of process lists and logs
     $a = PveArgs $s

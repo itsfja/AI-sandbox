@@ -557,7 +557,10 @@ it yourself:
 That replaces a standalone `/root/ai-sandbox.sh` with a link (the old file
 is kept as `ai-sandbox.sh.bak`). Without a link, a second copy would update
 itself from `main` and, on its next build, point the GUI hooks at itself
-instead of at your clone. `init` warns when it sees that split.
+instead of at your clone. `init` warns when it sees that split. It also
+refuses to relink while a `provision.sh` beside the current copy would stop
+running (`ai-sandbox.sh` reads the one beside the file the link points to):
+copy it next to the clone first, as the message says.
 
 After that, for example for Claude Code on DeepSeek:
 
@@ -573,7 +576,7 @@ After that, for example for Claude Code on DeepSeek:
 | --- | --- |
 | `agents`, `status [agent]` | `ai-sandbox.sh agents` / `status` |
 | `up` / `down` / `reset <agent>` | the same, over an interactive session, so the work guard can still ask before it destroys unpushed work |
-| `secret <agent> [-Name VAR] [-FromClipboard]` | sets `VAR` (default: the agent's key name, see [Agents](#agents)) in `<agent>/secrets.env`, mode 600. The value is pasted at a hidden prompt (in the classic PowerShell window, paste with a right-click: Ctrl+V may not reach a hidden prompt) or, with `-FromClipboard`, read from the clipboard. It is sent on stdin, so it never appears on a command line, in history or in the host's log. Never paste a key at the normal `PS>` prompt: it lands in your PowerShell history |
+| `secret <agent> [-Name VAR] [-FromClipboard]` | sets `VAR` (default: the agent's key name, see [Agents](#agents)) in the agent's secrets file (`<agent>/secrets.env`, or `SECRETS_FILE` from its `config.env`), mode 600. For `claude`, a subscription token (`sk-ant-oat…`) is stored as `CLAUDE_CODE_OAUTH_TOKEN` and anything else as `ANTHROPIC_API_KEY`; setting either removes the other, since Claude Code would otherwise keep using the API key. The value is pasted at a hidden prompt (in the classic PowerShell window, paste with a right-click: Ctrl+V may not reach a hidden prompt) or, with `-FromClipboard`, read from the clipboard. It is sent on stdin, so it never appears on a command line, in history or in the host's log. Never paste a key at the normal `PS>` prompt: it lands in your PowerShell history |
 | `profile <file.sh>` | installs a drop-in profile, checked by `ai-sandbox.sh` and rolled back if refused |
 | `connect <agent> [folder]`, `ssh <agent>` | asks the host for the sandbox IP (and, once, the sandbox key), updates the `ai-sandbox-<agent>` block in `~\.ssh\config` (the same block `vscode-connect.ps1` manages), then opens VS Code or ssh |
 
@@ -584,8 +587,9 @@ What the desktop key can and cannot do:
   forwarding) is refused. The client's words are split, never evaluated by a
   shell, and every call is logged to syslog (tag `ai-sandbox-remote`)
   without secret values or profile bodies.
-- It can read the sandbox SSH key (`key`), which opens the sandboxes and
-  nothing else.
+- It can read the sandbox SSH key (`key`, honouring `SSH_KEY_FILE`), which
+  opens the sandboxes and nothing else. With `SSH_PUBKEY` set, the host has
+  no managed key to give out: put your own private key at `~\.ssh\ai-sandbox`.
 - **Profile upload is off by default.** A drop-in profile runs as root on
   the host, so allowing it makes the desktop key as powerful as root. Turn it
   on only if you accept that, with `REMOTE_PROFILES=on` in
@@ -594,7 +598,18 @@ What the desktop key can and cannot do:
 - Treat the desktop key like any other credential: give it a passphrase,
   and revoke it on the host with `/root/ai-sandbox-remote.sh remove-keys`
   (`list-keys` shows what is installed). `init` refuses to restrict a key
-  that already has full root access, so your own admin key is never cut off.
+  that already has other access (such as a full root login), so your own
+  admin key is never cut off.
+- **Do not load the desktop key into ssh-agent** (`ssh-add`). ssh offers
+  agent keys before your identity files, so a plain `ssh root@<host>` would
+  log in with it and get only the sandbox verbs, not a shell. `ai-sandbox.ps1`
+  names the key itself on every call, so it never needs the agent; it warns
+  when the key is loaded (`ssh-add -d ~\.ssh\ai-sandbox-pve` removes it),
+  and `init` and `vscode-connect.ps1` then log in to the host without the
+  agent's keys.
+- Key changes are written in place (on Proxmox, `authorized_keys` is a link
+  into the cluster filesystem) and only after the new content is checked: a
+  failed read or write, such as a full `/tmp`, leaves the file as it was.
 
 Settings: `-PveHost` beats `desktop.env`, which beats `$env:PVE_HOST`;
 `desktop.env` also holds `PVE_KEY` (the desktop key) and `PVE_DIR` (where
