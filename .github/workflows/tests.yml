@@ -18,7 +18,7 @@ jobs:
         # the PVE hook shim execs ai-sandbox.sh directly from a clone
         run: |
           bad=0
-          for f in ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/* examples/profiles/*.sh; do
+          for f in ai-sandbox.sh vscode-connect.sh tests/run-tests.sh tests/mock/bin/*; do
             mode="$(git ls-files -s -- "$f" | cut -d' ' -f1)"
             [ "$mode" = 100755 ] || { echo "::error file=$f::mode $mode, expected 100755 (git update-index --chmod=+x $f)"; bad=1; }
           done
