@@ -538,9 +538,27 @@ login one time, then never again):
 ```
 
 `init` creates `~\.ssh\ai-sandbox-pve` (set a passphrase if you like),
-installs `ai-sandbox-remote.sh` on the host, installs `ai-sandbox.sh` only
-if the host has none, adds the key to root's `authorized_keys` with the
-forced command, and saves the host in `%USERPROFILE%\.ai-sandbox\desktop.env`.
+installs `ai-sandbox-remote.sh` on the host, adds the key to root's
+`authorized_keys` with the forced command, and saves the host in
+`%USERPROFILE%\.ai-sandbox\desktop.env`.
+
+The desktop must run the same `ai-sandbox.sh` you run on the host, so
+`init` makes `/root/ai-sandbox.sh` that copy. It keeps an existing
+`/root/ai-sandbox.sh`. If there is none, it links it to the script the
+Proxmox GUI hooks already run, or to a git clone of this repo in `/root`
+(such as `/root/AI-sandbox`). It installs a fresh, self-updating copy only
+when it finds neither. With a git clone elsewhere, or several of them, name
+it yourself:
+
+```powershell
+.\ai-sandbox.ps1 init -PveHost root@192.168.3.188 -PveScript /opt/AI-sandbox/ai-sandbox.sh
+```
+
+That replaces a standalone `/root/ai-sandbox.sh` with a link (the old file
+is kept as `ai-sandbox.sh.bak`). Without a link, a second copy would update
+itself from `main` and, on its next build, point the GUI hooks at itself
+instead of at your clone. `init` warns when it sees that split.
+
 After that, for example for Claude Code on DeepSeek:
 
 ```powershell

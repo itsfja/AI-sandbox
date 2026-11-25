@@ -35,6 +35,11 @@
 #                                             (file, or one line on stdin)
 #   ai-sandbox-remote.sh list-keys            show the restricted keys
 #   ai-sandbox-remote.sh remove-keys          remove every restricted key
+#   ai-sandbox-remote.sh install-script <copy> [path]
+#       make ai-sandbox.sh beside this script the copy you already run:
+#       link to [path] if given; else keep an existing one; else link to
+#       the script the PVE GUI hook shim runs, or to the one git clone of
+#       this repo in this directory; else install <copy>. (Run by init.)
 #
 # Every remote call is logged to syslog (tag ai-sandbox-remote) with the
 # client address and verb; secret values and profile bodies never are.
@@ -247,11 +252,76 @@ remove_keys() {
   echo "removed $n restricted key(s) from $AUTH_KEYS"
 }
 
+# --------------------------- which ai-sandbox.sh ----------------------------
+# The verbs run $SCRIPT (ai-sandbox.sh beside this file). It must be the
+# copy the host already uses: a second, curl-style copy would self-update
+# from main and, on its next build, point the PVE GUI hook shim at itself
+# instead of at your git clone. So link to the existing one when there is
+# one; ai-sandbox.sh resolves the link (readlink -f) for every path it uses.
+
+hook_target() {   # the script the PVE hook shim execs, if it still exists
+  local f="${HOOK_SNIPPET_DIR:-/var/lib/vz/snippets}/ai-sandbox-hook.sh" p
+  [ -f "$f" ] || return 0
+  p="$(sed -n 's/^exec \([^ ]*\) hook .*/\1/p' "$f" | head -n 1)"
+  [ -n "$p" ] && [ -f "$p" ] && echo "$p"
+  return 0
+}
+
+find_clone() {   # the one git clone of this repo directly beside $SCRIPT
+  local c found="" n=0
+  for c in "$(dirname "$SCRIPT")"/*/ai-sandbox.sh; do
+    [ -f "$c" ] && [ -e "$(dirname "$c")/.git" ] || continue
+    found="$c"; n=$((n + 1))
+  done
+  if [ "$n" -gt 1 ]; then
+    echo "note: several git clones of AI-sandbox beside $SCRIPT; not guessing (init -PveScript <path> picks one)" >&2
+    return 0
+  fi
+  [ -z "$found" ] || echo "$found"
+}
+
+link_script() {   # $1 = the ai-sandbox.sh to use
+  local real
+  real="$(readlink -f "$1")"
+  [ "$real" != "$(readlink -f "$SCRIPT" 2>/dev/null || true)" ] || { echo "keeping $SCRIPT (already $real)"; return 0; }
+  if [ -f "$SCRIPT" ] && [ ! -L "$SCRIPT" ]; then
+    mv -f "$SCRIPT" "${SCRIPT}.bak"
+    echo "moved the standalone copy aside: ${SCRIPT}.bak"
+  fi
+  ln -sfn "$real" "$SCRIPT"
+  echo "linked $SCRIPT -> $real (the copy you already run; nothing replaced it)"
+}
+
+install_script() {   # $1 = copy to install when none exists; $2 = optional path to use
+  local copy="${1:-}" want="${2:-}" t
+  if [ -n "$want" ]; then
+    [[ "$want" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "invalid path '$want'"
+    [ -f "$want" ] || die "no ai-sandbox.sh at $want"
+    link_script "$want"
+    return 0
+  fi
+  t="$(hook_target)"
+  if [ -e "$SCRIPT" ]; then
+    echo "keeping the existing $SCRIPT"
+    if [ -n "$t" ] && [ "$(readlink -f "$t")" != "$(readlink -f "$SCRIPT")" ]; then
+      echo "warning: the Proxmox GUI hooks run $t, but the desktop would run $SCRIPT." >&2
+      echo "  make them one copy: init -PveScript $t (or: ln -sfn $t $SCRIPT)" >&2
+    fi
+    return 0
+  fi
+  [ -n "$t" ] || t="$(find_clone)"
+  if [ -n "$t" ]; then link_script "$t"; return 0; fi
+  [ -f "$copy" ] || die "usage: install-script <copy-of-ai-sandbox.sh> [path]"
+  install -m 755 "$copy" "$SCRIPT"
+  echo "installed $SCRIPT (no existing ai-sandbox.sh found; this copy self-updates from main)"
+}
+
 # --------------------------- dispatch ---------------------------------------
 case "${1:-}" in
   --remote)    run_remote ;;
   install-key) local_guard; install_key "${2:-}" ;;
   list-keys)   local_guard; list_keys ;;
   remove-keys) local_guard; remove_keys ;;
+  install-script) local_guard; install_script "${2:-}" "${3:-}" ;;
   *) awk 'NR == 1 || /^# ====/ {next} /^set -/ {exit} /^#/ {sub(/^# ?/, ""); print}' "$0"; exit 1 ;;
 esac

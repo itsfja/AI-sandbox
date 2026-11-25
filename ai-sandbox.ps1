@@ -8,6 +8,8 @@
 #
 # Usage (Windows 10+, PowerShell; ssh/scp/ssh-keygen are built in):
 #   .\ai-sandbox.ps1 init -PveHost root@192.168.3.188   once: key + host side
+#                    [-PveScript /root/AI-sandbox/ai-sandbox.sh]  the host's script, if
+#                                                       init should not find it itself
 #   .\ai-sandbox.ps1 agents                             list agent profiles
 #   .\ai-sandbox.ps1 status [agent]
 #   .\ai-sandbox.ps1 up <agent> [-Code]                 build; -Code opens VS Code
@@ -32,6 +34,7 @@ param(
   [Parameter(Position = 1)][string]$Target = '',
   [Parameter(Position = 2)][string]$Folder = '/root',
   [string]$PveHost = '',
+  [string]$PveScript = '',
   [string]$Name = '',
   [switch]$Code,
   [switch]$FromClipboard
@@ -216,6 +219,7 @@ switch ($Command) {
     if (-not $s.PVE_HOST) { Die "usage: .\ai-sandbox.ps1 init -PveHost root@<proxmox address>" }
     if ($s.PVE_HOST -notmatch '^[A-Za-z0-9._-]+@[A-Za-z0-9.:_-]+$') { Die "PVE_HOST must look like root@192.168.3.188" }
     if ($s.PVE_DIR -notmatch '^/[A-Za-z0-9._/-]*$') { Die "PVE_DIR must be an absolute path like /root" }
+    if ($PveScript -and $PveScript -notmatch '^/[A-Za-z0-9._/-]+$') { Die "-PveScript must be an absolute path on the host, like /root/AI-sandbox/ai-sandbox.sh" }
     foreach ($tool in 'ssh', 'ssh-keygen') {
       if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { Die "$tool not found; Settings > Apps > Optional Features > OpenSSH Client" }
     }
@@ -231,9 +235,10 @@ switch ($Command) {
     $pub = (Get-Content "$($s.PVE_KEY).pub" | Select-Object -First 1)
     if ($pub -notmatch '^[a-z0-9@.-]+ [A-Za-z0-9+/]+=* ?[A-Za-z0-9@._-]*$') { Die "unexpected public key format in $($s.PVE_KEY).pub" }
     # One login does it all: a script on stdin carries both files (base64)
-    # and the public key. It installs the dispatcher, keeps an existing
-    # ai-sandbox.sh (that copy self-updates), and pins the key to the
-    # dispatcher.
+    # and the public key. It installs the dispatcher, points it at the
+    # ai-sandbox.sh the host already runs (-PveScript, an existing copy, the
+    # GUI hooks' script or a git clone; a fresh copy only when there is
+    # none), and pins the key to the dispatcher.
     $d = $s.PVE_DIR
     $nl = "`n"
     $setup = @(
@@ -243,7 +248,7 @@ switch ($Command) {
       'base64 -d > "$t/remote" <<''B64''', (ConvertTo-LfBase64 $remote), 'B64',
       'base64 -d > "$t/main" <<''B64''', (ConvertTo-LfBase64 $main), 'B64',
       'install -m 755 "$t/remote" "$d/ai-sandbox-remote.sh"',
-      'if [ -e "$d/ai-sandbox.sh" ]; then echo "keeping the existing $d/ai-sandbox.sh"; else install -m 755 "$t/main" "$d/ai-sandbox.sh"; echo "installed $d/ai-sandbox.sh"; fi',
+      "`"`$d/ai-sandbox-remote.sh`" install-script `"`$t/main`" '$PveScript'",
       "printf '%s\n' '$pub' | `"`$d/ai-sandbox-remote.sh`" install-key",
       '# end'
     ) -join $nl

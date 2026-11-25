@@ -167,6 +167,45 @@ check_sh "a symlinked authorized_keys (PVE cluster fs) stays a symlink, written 
 out="$(L 2>&1)"; rc=$?
 check_sh "no arguments prints usage" '[ $rc -ne 0 ] && grep -q "Remote verbs" <<<"$out"'
 
+echo "== install-script (init: use the ai-sandbox.sh the host already runs)"
+IS() {   # install-script in a fake /root ($T/root) with a fake snippets dir
+  env -u SSH_ORIGINAL_COMMAND AI_SANDBOX_SCRIPT="$T/root/ai-sandbox.sh" HOOK_SNIPPET_DIR="$T/snip" \
+    AUTHORIZED_KEYS="$T/home/.ssh/authorized_keys" bash "$SRC" install-script "$@"
+}
+fresh_root() {
+  fresh; mkdir -p "$T/root" "$T/snip"
+  printf '#!/usr/bin/env bash\necho fresh-copy\n' > "$T/copy.sh"
+}
+make_clone() {   # $1 = dir under $T/root
+  mkdir -p "$T/root/$1/.git"; printf '#!/usr/bin/env bash\necho %s\n' "$1" > "$T/root/$1/ai-sandbox.sh"
+}
+fresh_root
+out="$(IS "$T/copy.sh" "" 2>&1)"; rc=$?
+check_sh "nothing on the host: installs the copy" '[ $rc -eq 0 ] && [ -f "$T/root/ai-sandbox.sh" ] && [ ! -L "$T/root/ai-sandbox.sh" ] && grep -q fresh-copy "$T/root/ai-sandbox.sh" && grep -q "self-updates" <<<"$out"'
+fresh_root; make_clone AI-sandbox
+out="$(IS "$T/copy.sh" "" 2>&1)"; rc=$?
+check_sh "a git clone beside it: links to the clone, no copy" '[ $rc -eq 0 ] && [ -L "$T/root/ai-sandbox.sh" ] && [ "$(readlink -f "$T/root/ai-sandbox.sh")" = "$(readlink -f "$T/root/AI-sandbox/ai-sandbox.sh")" ]'
+fresh_root; make_clone AI-sandbox; make_clone other
+mkdir -p "$T/elsewhere"; printf '#!/usr/bin/env bash\n' > "$T/elsewhere/ai-sandbox.sh"
+printf '#!/usr/bin/env bash\nvmid="$1"; phase="$2"\nexec %s hook "$vmid" "$phase"\n' "$T/elsewhere/ai-sandbox.sh" > "$T/snip/ai-sandbox-hook.sh"
+out="$(IS "$T/copy.sh" "" 2>&1)"; rc=$?
+check_sh "the script the GUI hook shim runs wins over clones" '[ $rc -eq 0 ] && [ "$(readlink -f "$T/root/ai-sandbox.sh")" = "$(readlink -f "$T/elsewhere/ai-sandbox.sh")" ]'
+fresh_root; make_clone AI-sandbox; make_clone other
+out="$(IS "$T/copy.sh" "" 2>&1)"; rc=$?
+check_sh "two clones and no hook: does not guess, installs the copy" '[ $rc -eq 0 ] && [ ! -L "$T/root/ai-sandbox.sh" ] && grep -q "not guessing" <<<"$out"'
+fresh_root; make_clone AI-sandbox; cp "$T/copy.sh" "$T/root/ai-sandbox.sh"
+printf '#!/usr/bin/env bash\nexec %s hook "$1" "$2"\n' "$T/root/AI-sandbox/ai-sandbox.sh" > "$T/snip/ai-sandbox-hook.sh"
+out="$(IS "$T/copy.sh" "" 2>&1)"; rc=$?
+check_sh "an existing copy is kept, with a warning when the GUI hooks run another" '[ $rc -eq 0 ] && [ ! -L "$T/root/ai-sandbox.sh" ] && grep -q "keeping the existing" <<<"$out" && grep -q "GUI hooks run" <<<"$out"'
+out="$(IS "$T/copy.sh" "$T/root/AI-sandbox/ai-sandbox.sh" 2>&1)"; rc=$?
+check_sh "-PveScript links to that path and keeps the old copy as .bak" '[ $rc -eq 0 ] && [ -L "$T/root/ai-sandbox.sh" ] && [ -f "$T/root/ai-sandbox.sh.bak" ] && grep -q fresh-copy "$T/root/ai-sandbox.sh.bak"'
+out="$(IS "$T/copy.sh" "$T/root/AI-sandbox/ai-sandbox.sh" 2>&1)"; rc=$?
+check_sh "  ...and is idempotent" '[ $rc -eq 0 ] && grep -q "already" <<<"$out"'
+out="$(IS "$T/copy.sh" "$T/root/nope/ai-sandbox.sh" 2>&1)"; rc=$?
+check_sh "-PveScript to a missing file is refused" '[ $rc -ne 0 ] && grep -q "no ai-sandbox.sh at" <<<"$out"'
+out="$(IS "$T/copy.sh" '/root/x;rm -rf /' 2>&1)"; rc=$?
+check_sh "-PveScript with shell characters is refused" '[ $rc -ne 0 ] && grep -q "invalid path" <<<"$out"'
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]
