@@ -694,6 +694,54 @@ rm -f "$PD"/*.sh
 out="$(run "$S" agents 2>&1)"; rc=$?
 check_sh "with the bad drop-in removed, everything works again" '[ $rc -eq 0 ] && grep -q "mistral *CT 1051" <<<"$out"'
 
+echo "== example drop-in: Claude Code on DeepSeek"
+fresh
+PD="$T/state/profiles"; mkdir -p "$PD"; chmod 755 "$PD"
+DS="$(cd "$HERE/../.." && pwd)/examples/profiles/deepseek.sh"
+dropin deepseek < "$DS"; dropin codex < "$EXAMPLE"
+out="$(run "$S" agents 2>&1)"; rc=$?
+check_sh "both example drop-ins load side by side (deepseek CT 1055, codex CT 1054)" '[ $rc -eq 0 ] && grep -q "deepseek *CT 1055 *Claude Code on DeepSeek" <<<"$out" && grep -q "codex *CT 1054" <<<"$out"'
+rm -f "$PD/codex.sh"
+out="$(run "$S" up deepseek 2>&1)"; rc=$?
+check "up deepseek without secrets exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+check_sh "  ...with the DeepSeek Platform hint" 'grep -q "platform.deepseek.com/api_keys" <<<"$out" && grep -q "DEEPSEEK_API_KEY=" <<<"$out"'
+P="$T/ct/1055/root/provision-base.sh"
+check_sh "  ...own CT and hostname, Claude Code native installer, verify" 'grep -q "^hostname: ai-sandbox-deepseek$" "$T/conf/1055.conf" && grep -q "curl -fsSL https://claude.ai/install.sh | bash" "$P" && [ "$(tail -n1 "$P")" = "claude --version" ]'
+M="$T/ct/1055/etc/claude-code/managed-settings.json"
+check_sh "  ...same managed-settings policy as claude (444)" '[ "$(stat -c %a "$M")" = 444 ] && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[\"permissions\"][\"disableBypassPermissionsMode\"]==\"disable\" and d[\"allowedMcpServers\"]==[]" "$M"'
+mkdir -p "$T/state/deepseek"; printf 'DEEPSEEK_API_KEY="sk-test_not.real"\n' > "$T/state/deepseek/secrets.env"; chmod 600 "$T/state/deepseek/secrets.env"
+: > "$T/calls.log"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+U="$T/ct/1055/root/.claude/settings.json"
+check_sh "key -> settings.json env: DeepSeek endpoint, auth token, default models (600)" '[ $rc -eq 0 ] && [ "$(stat -c %a "$U")" = 600 ] && python3 -c "
+import json,sys; e=json.load(open(sys.argv[1]))[\"env\"]
+assert e[\"ANTHROPIC_BASE_URL\"]==\"https://api.deepseek.com/anthropic\" and e[\"ANTHROPIC_AUTH_TOKEN\"]==\"sk-test_not.real\"
+assert e[\"ANTHROPIC_MODEL\"]==e[\"ANTHROPIC_DEFAULT_OPUS_MODEL\"]==e[\"ANTHROPIC_DEFAULT_SONNET_MODEL\"]==\"deepseek-v4-pro\"
+assert e[\"ANTHROPIC_DEFAULT_HAIKU_MODEL\"]==e[\"CLAUDE_CODE_SUBAGENT_MODEL\"]==\"deepseek-flash\"
+assert \"ANTHROPIC_API_KEY\" not in e" "$U"'
+check "  ...and the key never appears on a command line" bash -c '! grep -q "sk-test_not" "$1"' _ "$T/calls.log"
+printf 'DEEPSEEK_MODEL=deepseek-flash[1m]\nDEEPSEEK_SMALL_MODEL=deepseek-flash\n' > "$T/state/deepseek/config.env"; chmod 600 "$T/state/deepseek/config.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "DEEPSEEK_MODEL in config.env overrides the main model ([1m] allowed)" '[ $rc -eq 0 ] && python3 -c "import json,sys; e=json.load(open(sys.argv[1]))[\"env\"]; assert e[\"ANTHROPIC_MODEL\"]==\"deepseek-flash[1m]\"" "$U"'
+printf 'DEEPSEEK_MODEL=x","ANTHROPIC_BASE_URL":"http://evil\n' > "$T/state/deepseek/config.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "a model name that could break the JSON is refused" '[ $rc -ne 0 ] && grep -q "invalid DeepSeek model name" <<<"$out"'
+rm -f "$T/state/deepseek/config.env"
+printf 'DEEPSEEK_API_KEY=sk-x$(touch %s/pwned)\n' "$T" > "$T/state/deepseek/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "a key with shell metacharacters is refused, never executed" '[ $rc -ne 0 ] && grep -q "has characters a key never contains" <<<"$out" && [ ! -e "$T/pwned" ]'
+printf 'ANTHROPIC_API_KEY=sk-ant-x\n' > "$T/state/deepseek/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "a secrets file without DEEPSEEK_API_KEY fails clearly" '[ $rc -ne 0 ] && grep -q "no DEEPSEEK_API_KEY line" <<<"$out"'
+out="$(run "$S" export deepseek 2>&1)"
+check "export suggests the Claude Code VS Code extension" grep -q 'anthropic.claude-code' <<<"$out"
+printf 'lvmthin: local-lvm\n\tthinpool data\n\tvgname pve\n' > "$T/storage.cfg"
+out="$(run STORAGE_CFG="$T/storage.cfg" "$S" bake 2>&1)"; rc=$?
+G="$T/ct/1048/root/provision-base.sh"
+check_sh "bake with claude + deepseek installs Claude Code once" '[ $rc -eq 0 ] && grep -q "agents=claude,deepseek,gemini,mistral$" "$T/state/golden/stamp" && [ "$(grep -c "claude.ai/install.sh" "$G")" = 1 ] && grep -q "same installer as an agent above" "$G" && [ "$(grep -c "^claude --version$" "$G")" = 2 ]'
+rm -f "$PD"/*.sh
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

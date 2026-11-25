@@ -18,7 +18,7 @@ and that several agents can run side by side.
 | Mistral Vibe CLI | `mistral` | available |
 | Claude Code | `claude` | available |
 | Gemini CLI | `gemini` | available |
-| anything else (e.g. OpenAI Codex CLI) | drop-in profile | available (see [Writing a profile](#writing-a-profile)) |
+| anything else (examples: OpenAI Codex CLI, Claude Code on DeepSeek) | drop-in profile | available (see [Writing a profile](#writing-a-profile)) |
 
 See [Roadmap](#roadmap) for what is coming and the design decisions behind it.
 
@@ -212,6 +212,7 @@ store and lock. Defaults:
 | `claude` | 1052 | `ai-sandbox-claude` | `ANTHROPIC_API_KEY=` or `CLAUDE_CODE_OAUTH_TOKEN=` → `/root/.claude/settings.json` | `/etc/claude-code/managed-settings.json` |
 | `gemini` | 1053 | `ai-sandbox-gemini` | `GEMINI_API_KEY=<key>` → `/root/.gemini/.env` | `/etc/gemini-cli/settings.json` |
 | `codex` (example drop-in) | 1054 | `ai-sandbox-codex` | `OPENAI_API_KEY=<key>` → `codex login --with-api-key` | `/etc/codex/requirements.toml` (mode 444) |
+| `deepseek` (example drop-in) | 1055 | `ai-sandbox-deepseek` | `DEEPSEEK_API_KEY=<key>` → `/root/.claude/settings.json` | as `claude` |
 
 Override an agent's CTID with `CTID=` in its `config.env`. Instances do
 not share locks, so `up mistral` and a GUI Start of another agent can run
@@ -335,6 +336,20 @@ chmod 600 /root/.ai-sandbox/codex/secrets.env
 /root/ai-sandbox.sh agents        # codex   CT 1054   OpenAI Codex CLI
 /root/ai-sandbox.sh up codex
 ```
+
+A second example, [`examples/profiles/deepseek.sh`](examples/profiles/deepseek.sh)
+(CT 1055), runs the same Claude Code CLI, policy and VS Code extension as
+`claude`, pointed at DeepSeek's Anthropic-compatible API with a DeepSeek
+Platform key (`DEEPSEEK_API_KEY=` from platform.deepseek.com/api_keys); no
+Anthropic account is involved. It reuses the built-in `claude` functions
+for install, verify and policy, and a bake that includes both installs
+Claude Code once. The models default to `deepseek-v4-pro` (main, Opus and
+Sonnet slots) and `deepseek-flash` (Haiku slot and subagents); set
+`DEEPSEEK_MODEL` / `DEEPSEEK_SMALL_MODEL` in
+`/root/.ai-sandbox/deepseek/config.env` to change them (`[1m]` suffix
+allowed). DeepSeek ignores prompt caching, so long sessions cost more than
+the token count suggests. The file's header has the install steps and the
+rest of DeepSeek's limits.
 
 A drop-in is sourced as root on every run, so the script checks it first,
 and refuses it (and stops) when:
@@ -1036,7 +1051,7 @@ Work is tracked as PTFs (fixes delivered as PRs):
    settings policy, Node 22 for the npm package.
 5. **PTF 5 — drop-in profiles** *(done)*: any other agent as
    `/root/.ai-sandbox/profiles/<agent>.sh`, checked before it is
-   sourced; Codex CLI as the shipped example.
+   sourced; Codex CLI and Claude Code on DeepSeek as shipped examples.
 
 Decisions so far: parallel instances (one CT per agent from a shared
 golden template); both API keys and subscription tokens supported where

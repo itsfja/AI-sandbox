@@ -1600,10 +1600,20 @@ mkdir -p /etc/ssh/sshd_config.d
 printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/10-ai-sandbox-root-key-only.conf
 sshd -t && systemctl reload ssh >/dev/null 2>&1 || true
 EOF
+  local snippet sum seen=" "
   for a in "${agents[@]}"; do
     echo
     echo "# ---- agent profile: $a install ----"
-    "profile_${a}_install"
+    # profiles that share a CLI (claude and a drop-in built on it) install
+    # it once per image
+    snippet="$("profile_${a}_install")"
+    sum="$(printf '%s' "$snippet" | sha256sum | cut -c1-64)"
+    if [[ "$seen" == *" $sum "* ]]; then
+      echo "# (same installer as an agent above)"
+    else
+      printf '%s\n' "$snippet"
+      seen+="$sum "
+    fi
     echo
     echo "# ---- agent profile: $a verify ----"
     "profile_${a}_verify"
