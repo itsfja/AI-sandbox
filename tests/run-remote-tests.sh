@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # out and rc are read inside check_sh's eval'd conditions
 # Tests for ai-sandbox-remote.sh, the restricted SSH entry point. Runs as
 # any user: ai-sandbox.sh is replaced by a stub that records its argv, and
 # STATE_DIR / AUTHORIZED_KEYS point into a temp dir.
@@ -159,8 +160,7 @@ check_sh "remove-keys drops restricted keys, keeps others" '! grep -q ai-sandbox
 out="$(env AUTHORIZED_KEYS="$T/other_keys" SSH_ORIGINAL_COMMAND="x" bash "$SRC" install-key <<<"$K" 2>&1)"; rc=$?
 check_sh "key management refuses to run over ssh" '[ $rc -ne 0 ] && grep -q "local only" <<<"$out" && [ ! -e "$T/other_keys" ]'
 fresh
-mkdir -p "$T/pvecfs"; printf 'ssh-rsa AAAAClusterNodeKey root@pve2
-' > "$T/pvecfs/authorized_keys"
+mkdir -p "$T/pvecfs"; printf 'ssh-rsa AAAAClusterNodeKey root@pve2\n' > "$T/pvecfs/authorized_keys"
 ln -s "$T/pvecfs/authorized_keys" "$T/home/.ssh/authorized_keys"
 L install-key <<<"$K" >/dev/null 2>&1; L remove-keys >/dev/null 2>&1; L install-key <<<"$K" >/dev/null 2>&1
 check_sh "a symlinked authorized_keys (PVE cluster fs) stays a symlink, written through" '[ -L "$T/home/.ssh/authorized_keys" ] && grep -q ai-sandbox-remote "$T/pvecfs/authorized_keys" && grep -q ClusterNodeKey "$T/pvecfs/authorized_keys"'
