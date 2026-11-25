@@ -13,14 +13,15 @@
 #   .\ai-sandbox.ps1 up <agent> [-Code]                 build; -Code opens VS Code
 #   .\ai-sandbox.ps1 down <agent>
 #   .\ai-sandbox.ps1 reset <agent> [-Code]
-#   .\ai-sandbox.ps1 secret <agent> [-Name VAR]         set the agent's key (typed hidden)
+#   .\ai-sandbox.ps1 secret <agent> [-Name VAR]         set the agent's key (pasted hidden,
+#                    [-FromClipboard]                   or read from the clipboard)
 #   .\ai-sandbox.ps1 profile <file.sh>                  upload a drop-in profile
 #                                                       (host must allow it: REMOTE_PROFILES=on)
 #   .\ai-sandbox.ps1 connect <agent> [folder]           VS Code into the sandbox
 #   .\ai-sandbox.ps1 ssh <agent>                        terminal into the sandbox
 #
 # Settings: %USERPROFILE%\.ai-sandbox\desktop.env (written by init), plain
-# KEY=value lines; $env:PVE_HOST or -PveHost override PVE_HOST.
+# KEY=value lines. PVE_HOST: -PveHost, then desktop.env, then $env:PVE_HOST.
 #   PVE_HOST   root@<proxmox address>
 #   PVE_KEY    desktop key pinned to ai-sandbox-remote.sh (default ~\.ssh\ai-sandbox-pve)
 #   PVE_DIR    where ai-sandbox.sh lives on the host (default /root)
@@ -32,7 +33,8 @@ param(
   [Parameter(Position = 2)][string]$Folder = '/root',
   [string]$PveHost = '',
   [string]$Name = '',
-  [switch]$Code
+  [switch]$Code,
+  [switch]$FromClipboard
 )
 
 $ErrorActionPreference = 'Stop'
@@ -158,6 +160,7 @@ Host $alias
     User root
     IdentityFile ~/.ssh/ai-sandbox
     IdentitiesOnly yes
+    LogLevel ERROR
     # disposable sandbox: every rebuild mints a FRESH host key; scoped to this alias only
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
@@ -174,11 +177,20 @@ $end
   Set-Content -Path $SshConfig -Value $conf -Encoding Ascii
   Note "ssh config: Host $alias -> $ip"
   foreach ($i in 1..15) {
-    ssh -o BatchMode=yes -o ConnectTimeout=5 $alias true 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { return $alias }
+    if (Test-SandboxSsh $alias) { return $alias }
     Start-Sleep -Seconds 2
   }
   Die "ssh $alias does not answer; check '.\ai-sandbox.ps1 status $agent'"
+}
+
+# rc 0 from "ssh <alias> true". Under $ErrorActionPreference = 'Stop',
+# Windows PowerShell turns a redirected stderr line from a native command
+# (even ssh's "Permanently added ... to known hosts") into a terminating
+# error, so this probe runs with 'Continue' and ssh logs errors only.
+function Test-SandboxSsh([string]$alias) {
+  $ErrorActionPreference = 'Continue'
+  ssh -o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=ERROR $alias true 2>$null | Out-Null
+  return ($LASTEXITCODE -eq 0)
 }
 
 function Open-Code($s, [string]$agent, [string]$folder) {
@@ -273,11 +285,25 @@ switch ($Command) {
     if (-not $var) { $var = $SecretNames[$Target] }
     if (-not $var) { Die "no default secret name for '$Target'; pass -Name VAR_NAME" }
     if ($var -cnotmatch '^[A-Z][A-Z0-9_]{0,63}$') { Die "invalid -Name '$var'" }
-    $sec = Read-Host -AsSecureString "$var for $Target (hidden)"
-    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-    try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+    if ($FromClipboard) {
+      $plain = Get-Clipboard -Raw
+    } else {
+      Note "paste the key and press Enter; nothing is shown. In the classic PowerShell window, paste with a right-click (Ctrl+V may not paste into a hidden prompt)."
+      $sec = Read-Host -AsSecureString "$var for $Target"
+      $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+      try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+      finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+    }
+    if ($plain) { $plain = $plain.Trim() }
     if (-not $plain) { Die "nothing entered; nothing changed" }
+    # the host's rule, checked here too so a failed paste gets a useful message
+    if ($plain -cnotmatch '^[A-Za-z0-9_.:/+=@-]+$' -or $plain.Length -lt 8) {
+      $n = $plain.Length
+      $plain = $null
+      Die ("that is not a key ($n character(s), or characters a key never contains); nothing changed.`n" +
+        "  The paste probably did not go through. Paste with a right-click, or copy the key and run:`n" +
+        "  .\ai-sandbox.ps1 secret $Target -FromClipboard")
+    }
     # stdin, never argv: the value stays out of process lists and logs
     $a = PveArgs $s
     $rc = Invoke-SshWithInput ($a + @("secret $Target $var")) $plain

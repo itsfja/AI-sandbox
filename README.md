@@ -555,7 +555,7 @@ After that, for example for Claude Code on DeepSeek:
 | --- | --- |
 | `agents`, `status [agent]` | `ai-sandbox.sh agents` / `status` |
 | `up` / `down` / `reset <agent>` | the same, over an interactive session, so the work guard can still ask before it destroys unpushed work |
-| `secret <agent> [-Name VAR]` | sets `VAR` (default: the agent's key name, see [Agents](#agents)) in `<agent>/secrets.env`, mode 600. The value is typed hidden and sent on stdin, so it never appears on a command line, in history or in the host's log |
+| `secret <agent> [-Name VAR] [-FromClipboard]` | sets `VAR` (default: the agent's key name, see [Agents](#agents)) in `<agent>/secrets.env`, mode 600. The value is pasted at a hidden prompt (in the classic PowerShell window, paste with a right-click: Ctrl+V may not reach a hidden prompt) or, with `-FromClipboard`, read from the clipboard. It is sent on stdin, so it never appears on a command line, in history or in the host's log. Never paste a key at the normal `PS>` prompt: it lands in your PowerShell history |
 | `profile <file.sh>` | installs a drop-in profile, checked by `ai-sandbox.sh` and rolled back if refused |
 | `connect <agent> [folder]`, `ssh <agent>` | asks the host for the sandbox IP (and, once, the sandbox key), updates the `ai-sandbox-<agent>` block in `~\.ssh\config` (the same block `vscode-connect.ps1` manages), then opens VS Code or ssh |
 
