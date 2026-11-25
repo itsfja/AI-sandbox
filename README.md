@@ -17,6 +17,7 @@ and that several agents can run side by side.
 | --- | --- | --- |
 | Mistral Vibe CLI | `mistral` | available |
 | Claude Code | `claude` | available |
+| Claude Code on DeepSeek | `deepseek` | available |
 | Gemini CLI | `gemini` | available |
 | anything else | drop-in profile | planned (PTF 5) |
 
@@ -271,6 +272,42 @@ CT 1052, hostname `ai-sandbox-claude`.
   the version the last bake installed.
 - **VS Code extension**: `anthropic.claude-code`.
 
+### Claude Code on DeepSeek (`deepseek`)
+
+CT 1054, hostname `ai-sandbox-deepseek`. The same Claude Code CLI, policy
+and VS Code extension as `claude`, pointed at DeepSeek's
+Anthropic-compatible API (`https://api.deepseek.com/anthropic`) instead of
+Anthropic's. It runs alongside `claude`, so you can compare the two.
+
+- **Credential**: `DEEPSEEK_API_KEY=...` in
+  `/root/.ai-sandbox/deepseek/secrets.env`, a key from
+  [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
+  (pay-as-you-go API billing with DeepSeek). Parsed, never executed, and
+  written with the endpoint as the `env` block of
+  `/root/.claude/settings.json` (mode 600): `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_AUTH_TOKEN` and the model variables below. No Anthropic
+  account or key is involved.
+- **Models**: DeepSeek accepts `deepseek-v4-pro` and `deepseek-flash`. By
+  default the main model (and Claude Code's Opus and Sonnet slots) is
+  `deepseek-v4-pro`, and the Haiku slot and subagents use `deepseek-flash`.
+  Change them in `/root/.ai-sandbox/deepseek/config.env`:
+
+  ```bash
+  DEEPSEEK_MODEL=deepseek-flash[1m]     # main model; [1m] = Claude Code's 1M-context mode
+  DEEPSEEK_SMALL_MODEL=deepseek-flash   # Haiku slot and subagents
+  ```
+
+  `/model` inside a session still switches between the slots.
+- **Limits**: these come from DeepSeek's side, not the sandbox. Prompt
+  caching is ignored, so long sessions cost more than the token count
+  suggests. MCP fields are ignored (MCP is off here anyway). Images in
+  earlier turns are refused or dropped depending on the model. Web search
+  works through DeepSeek's own search tool, billed as extra tokens.
+- **Policy, install, VS Code**: as for `claude`. A golden baked before this
+  profile existed has no `deepseek` entry, so the first `up deepseek` is a
+  full build until the next `bake`. The bake installs Claude Code once for
+  both profiles.
+
 ### Gemini CLI (`gemini`)
 
 CT 1053, hostname `ai-sandbox-gemini`.
@@ -388,6 +425,8 @@ Settings (all optional):
 | `MODE` | `auto` | how sessions are built: `auto` (linked clone of the golden when it has this agent, else full rebuild), `clone` (clone or refuse), `rebuild` (always the full build) |
 | `BAKE_SCHEDULE` | `Sun *-*-* 03:00:00` | when `timer on` bakes: a systemd `OnCalendar` expression (global config only) |
 | `TOPUP` | `off` | `on` = re-run the agent's CLI installer on a clone at spawn, for the latest release |
+| `DEEPSEEK_MODEL` | `deepseek-v4-pro` | `deepseek` only: main model (Opus and Sonnet slots) |
+| `DEEPSEEK_SMALL_MODEL` | `deepseek-flash` | `deepseek` only: Haiku slot and subagents |
 
 ## Golden template (bake)
 

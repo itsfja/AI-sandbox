@@ -69,7 +69,7 @@ fresh
 out="$(run "$S" agents)"; check "agents lists mistral with CT 1051" grep -q 'mistral *CT 1051 *Mistral Vibe CLI' <<<"$out"
 out="$(run "$S" up 2>&1)"; rc=$?
 check "up without agent fails" [ $rc -ne 0 ]
-check "  ...and names known agents" grep -q 'known agents: claude gemini mistral' <<<"$out"
+check "  ...and names known agents" grep -q 'known agents: claude deepseek gemini mistral' <<<"$out"
 out="$(run "$S" up bogus 2>&1)"; check "unknown agent rejected" grep -q "unknown agent 'bogus'" <<<"$out"
 out="$(run "$S" up 'Mistral;rm' 2>&1)"; check "invalid agent name rejected" grep -q "unknown agent" <<<"$out"
 out="$(run AGENT=mistral "$S" status 2>&1)"; check "AGENT env works for status" grep -q '^mistral: no sandbox (CT 1051 absent)' <<<"$out"
@@ -390,8 +390,9 @@ check "  ...strips SSH host keys, machine-id, authorized_keys" grep -qF 'rm -f /
 check "  ...and makes clones generate their own host keys at boot" grep -qF 'ExecStartPre=/usr/bin/ssh-keygen -A' "$T/calls.log"
 check "  ...checks every credential path" grep -q 'lxc-attach -n 1048 --clear-env -- env -i .* test -e /root/.vibe/.env$' "$T/calls.log"
 check_sh "  ...never injects a credential or policy" '! grep -q "/root/.vibe/.env\|config.toml" <(find "$T/ct/1048" -type f)'
-check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=claude,gemini,mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
+check "  ...stamps the image" grep -q '^baked=.* ctid=1048 agents=claude,deepseek,gemini,mistral$' "$T/ct/1048/etc/ai-sandbox-golden"
 check "  ...with every agent's CLI (BAKE_AGENTS=all)" grep -q 'curl -fsSL https://claude.ai/install.sh | bash' "$T/ct/1048/root/provision-base.sh"
+check_sh "  ...installing a CLI two profiles share (claude, deepseek) once" '[ "$(grep -c "claude.ai/install.sh" "$T/ct/1048/root/provision-base.sh")" = 1 ] && grep -q "same installer as an agent above" "$T/ct/1048/root/provision-base.sh"'
 check "  ...records it as current on the host" [ "$(cat "$T/state/golden/current")" = 1048 ]
 check "  ...build-time firewall removed (the template never runs)" [ ! -e "$T/fw/1048.fw" ]
 check_sh "  ...stop happens before template" '[ $(grep -n "^pct stop 1048" "$T/calls.log" | cut -d: -f1) -lt $(grep -n "^pct template 1048" "$T/calls.log" | cut -d: -f1) ]'
@@ -627,6 +628,44 @@ check_sh "a secrets file without GEMINI_API_KEY fails clearly" '[ $rc -ne 0 ] &&
 rm -f "$T/state/gemini/secrets.env"; run FORCE=1 RESCUE=0 "$S" up gemini >/dev/null 2>&1
 out="$(run "$S" export gemini 2>&1)"
 check "export suggests the Gemini VS Code companion" grep -q 'google.gemini-cli-vscode-ide-companion' <<<"$out"
+
+echo "== deepseek profile (Claude Code on DeepSeek)"
+fresh
+out="$(run "$S" agents)"
+check "agents lists deepseek with CT 1054" grep -q 'deepseek *CT 1054 *Claude Code on DeepSeek' <<<"$out"
+out="$(run "$S" up deepseek 2>&1)"; rc=$?
+check "up deepseek without secrets exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+check "  ...with the DeepSeek Platform hint" bash -c 'grep -q "platform.deepseek.com/api_keys" <<<"$1" && grep -q "DEEPSEEK_API_KEY=" <<<"$1"' _ "$out"
+P="$T/ct/1054/root/provision-base.sh"
+check_sh "  ...own CT and hostname, Claude Code native installer, verify" 'grep -q "^hostname: ai-sandbox-deepseek$" "$T/conf/1054.conf" && grep -q "curl -fsSL https://claude.ai/install.sh | bash" "$P" && [ "$(tail -n1 "$P")" = "claude --version" ]'
+M="$T/ct/1054/etc/claude-code/managed-settings.json"
+check_sh "  ...same managed-settings policy as claude (444)" '[ "$(stat -c %a "$M")" = 444 ] && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[\"permissions\"][\"disableBypassPermissionsMode\"]==\"disable\" and d[\"allowedMcpServers\"]==[]" "$M"'
+mkdir -p "$T/state/deepseek"; printf 'DEEPSEEK_API_KEY="sk-test_not.real"\n' > "$T/state/deepseek/secrets.env"; chmod 600 "$T/state/deepseek/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+U="$T/ct/1054/root/.claude/settings.json"
+check_sh "key -> settings.json env: DeepSeek endpoint, auth token, default models (600)" '[ $rc -eq 0 ] && [ "$(stat -c %a "$U")" = 600 ] && python3 -c "
+import json,sys; e=json.load(open(sys.argv[1]))[\"env\"]
+assert e[\"ANTHROPIC_BASE_URL\"]==\"https://api.deepseek.com/anthropic\" and e[\"ANTHROPIC_AUTH_TOKEN\"]==\"sk-test_not.real\"
+assert e[\"ANTHROPIC_MODEL\"]==e[\"ANTHROPIC_DEFAULT_OPUS_MODEL\"]==e[\"ANTHROPIC_DEFAULT_SONNET_MODEL\"]==\"deepseek-v4-pro\"
+assert e[\"ANTHROPIC_DEFAULT_HAIKU_MODEL\"]==e[\"CLAUDE_CODE_SUBAGENT_MODEL\"]==\"deepseek-flash\"
+assert \"ANTHROPIC_API_KEY\" not in e" "$U"'
+printf 'DEEPSEEK_MODEL=deepseek-flash[1m]\nDEEPSEEK_SMALL_MODEL=deepseek-flash\n' > "$T/state/deepseek/config.env"; chmod 600 "$T/state/deepseek/config.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "DEEPSEEK_MODEL in config.env overrides the main model ([1m] allowed)" '[ $rc -eq 0 ] && python3 -c "import json,sys; e=json.load(open(sys.argv[1]))[\"env\"]; assert e[\"ANTHROPIC_MODEL\"]==\"deepseek-flash[1m]\"" "$U"'
+printf 'DEEPSEEK_MODEL=x","ANTHROPIC_BASE_URL":"http://evil\n' > "$T/state/deepseek/config.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "a model name that could break the JSON is refused" '[ $rc -ne 0 ] && grep -q "invalid DeepSeek model name" <<<"$out"'
+rm -f "$T/state/deepseek/config.env"
+printf 'DEEPSEEK_API_KEY=sk-x$(touch %s/pwned)\n' "$T" > "$T/state/deepseek/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "a key with shell metacharacters is refused, never executed" '[ $rc -ne 0 ] && grep -q "has characters a key never contains" <<<"$out" && [ ! -e "$T/pwned" ]'
+printf 'ANTHROPIC_API_KEY=sk-ant-x\n' > "$T/state/deepseek/secrets.env"
+out="$(run FORCE=1 RESCUE=0 "$S" up deepseek 2>&1)"; rc=$?
+check_sh "a secrets file without DEEPSEEK_API_KEY fails clearly" '[ $rc -ne 0 ] && grep -q "no DEEPSEEK_API_KEY line" <<<"$out"'
+out="$(run "$S" export deepseek 2>&1)"
+check "export suggests the Claude Code VS Code extension" grep -q 'anthropic.claude-code' <<<"$out"
+
 
 echo
 echo "passed: $pass  failed: $fail"

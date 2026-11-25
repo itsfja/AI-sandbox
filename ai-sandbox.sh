@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
 # ai-sandbox.sh — single-use, rebuild-on-demand LXC sandboxes for AI coding
-#                 agents on Proxmox VE (Mistral Vibe, Claude Code and Gemini
-#                 CLI today; drop-in profiles to follow)
+#                 agents on Proxmox VE (Mistral Vibe, Claude Code, Claude
+#                 Code on DeepSeek and Gemini CLI today; drop-in profiles
+#                 to follow)
 #
 # Usage:  ai-sandbox.sh <command> [agent]        (or AGENT=<agent> in env)
 #
@@ -318,6 +319,64 @@ profile_claude_policy() {
   ct_push_file "$tmp" /etc/claude-code/managed-settings.json 444 || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
   echo "hardening: injected /etc/claude-code/managed-settings.json"
+}
+
+# ---- deepseek: Claude Code on DeepSeek's Anthropic-compatible API ----------
+# The same Claude Code CLI as `claude` (same install, verify and policy), in
+# its own CT, pointed at https://api.deepseek.com/anthropic with a DeepSeek
+# Platform key. DeepSeek accepts the model names deepseek-v4-pro and
+# deepseek-flash (and maps claude-opus* to the first, other claude* to the
+# second); DEEPSEEK_MODEL / DEEPSEEK_SMALL_MODEL in config.env override them.
+profile_deepseek_meta() {
+  PROFILE_CTID=1054
+  PROFILE_LABEL="Claude Code on DeepSeek"
+  PROFILE_VSCODE_EXT="anthropic.claude-code"
+}
+
+profile_deepseek_install() { profile_claude_install; }
+profile_deepseek_verify()  { profile_claude_verify; }
+profile_deepseek_policy()  { profile_claude_policy; }
+
+DEEPSEEK_BASE_URL="https://api.deepseek.com/anthropic"
+
+# secrets.env holds DEEPSEEK_API_KEY=sk-... (platform.deepseek.com/api_keys).
+# Parsed, never executed; written with the endpoint and model names as the
+# `env` block of the user settings, as for `claude`.
+profile_deepseek_credentials() {
+  local key model small tmp v
+  key="$(secrets_get DEEPSEEK_API_KEY "$SECRETS_FILE")"
+  [ -n "$key" ] || die "no DEEPSEEK_API_KEY line in $SECRETS_FILE"
+  [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] || die "DEEPSEEK_API_KEY in $SECRETS_FILE has characters a key never contains"
+  model="${DEEPSEEK_MODEL:-deepseek-v4-pro}"
+  small="${DEEPSEEK_SMALL_MODEL:-deepseek-flash}"
+  for v in "$model" "$small"; do
+    # [1m] is Claude Code's 1M-context suffix, which DeepSeek's docs use
+    [[ "$v" =~ ^[A-Za-z0-9_.:/-]+(\[1m\])?$ ]] || die "invalid DeepSeek model name '$v'"
+  done
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "$DEEPSEEK_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN": "$key",
+    "ANTHROPIC_MODEL": "$model",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$model",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$model",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$small",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$small"
+  }
+}
+EOF
+  ct_push_file "$tmp" /root/.claude/settings.json 600 || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  echo "credentials injected (host: $SECRETS_FILE -> CT: /root/.claude/settings.json env; $model / $small via $DEEPSEEK_BASE_URL)"
+}
+
+profile_deepseek_credential_paths() { profile_claude_credential_paths; }
+
+profile_deepseek_credentials_hint() {
+  echo "  create a key at platform.deepseek.com/api_keys, then run:"
+  echo "    printf 'DEEPSEEK_API_KEY=<key>\\n' > $SECRETS_FILE && chmod 600 $SECRETS_FILE"
 }
 
 # ---- gemini: Gemini CLI --------------------------------------------------------
@@ -1524,10 +1583,18 @@ mkdir -p /etc/ssh/sshd_config.d
 printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/10-ai-sandbox-root-key-only.conf
 sshd -t && systemctl reload ssh >/dev/null 2>&1 || true
 EOF
+  local snippet seen=()
   for a in "${agents[@]}"; do
     echo
     echo "# ---- agent profile: $a install ----"
-    "profile_${a}_install"
+    # profiles sharing a CLI (claude, deepseek) install it once per image
+    snippet="$("profile_${a}_install")"
+    if printf '%s\n' "${seen[@]}" | grep -qxF -- "$(printf '%s' "$snippet" | sha256sum | cut -c1-64)"; then
+      echo "# (same installer as an agent above)"
+    else
+      printf '%s\n' "$snippet"
+      seen+=("$(printf '%s' "$snippet" | sha256sum | cut -c1-64)")
+    fi
     echo
     echo "# ---- agent profile: $a verify ----"
     "profile_${a}_verify"
