@@ -54,6 +54,6 @@ jobs:
             foreach ($e in $errs) { Write-Output "::error file=$($f.Name)::$($e.Message)"; $bad = 1 }
           }
           if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) { Install-Module PSScriptAnalyzer -Force -Scope CurrentUser }
-          $r = Invoke-ScriptAnalyzer -Path . -Filter *.ps1 -Severity Error
+          $r = Get-ChildItem -Filter *.ps1 | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Severity Error }
           foreach ($x in $r) { Write-Output "::error file=$($x.ScriptName),line=$($x.Line)::$($x.RuleName): $($x.Message)"; $bad = 1 }
           exit $bad
