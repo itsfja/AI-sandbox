@@ -18,7 +18,7 @@ and that several agents can run side by side.
 | Mistral Vibe CLI | `mistral` | available |
 | Claude Code | `claude` | available |
 | Gemini CLI | `gemini` | available |
-| anything else | drop-in profile | planned (PTF 5) |
+| anything else (e.g. OpenAI Codex CLI) | drop-in profile | available (see [Writing a profile](#writing-a-profile)) |
 
 See [Roadmap](#roadmap) for what is coming and the design decisions behind it.
 
@@ -209,6 +209,9 @@ store and lock. Defaults:
 | Agent | CTID | Hostname | `secrets.env` | Policy file in the CT |
 | --- | --- | --- | --- | --- |
 | `mistral` | 1051 | `ai-sandbox-mistral` | `MISTRAL_API_KEY=<key>` → `/root/.vibe/.env` | `/root/.vibe/config.toml` (mode 400) |
+| `claude` | 1052 | `ai-sandbox-claude` | `ANTHROPIC_API_KEY=` or `CLAUDE_CODE_OAUTH_TOKEN=` → `/root/.claude/settings.json` | `/etc/claude-code/managed-settings.json` |
+| `gemini` | 1053 | `ai-sandbox-gemini` | `GEMINI_API_KEY=<key>` → `/root/.gemini/.env` | `/etc/gemini-cli/settings.json` |
+| `codex` (example drop-in) | 1054 | `ai-sandbox-codex` | `OPENAI_API_KEY=<key>` → `codex login --with-api-key` | `/etc/codex/requirements.toml` (mode 444) |
 
 Override an agent's CTID with `CTID=` in its `config.env`. Instances do
 not share locks, so `up mistral` and a GUI Start of another agent can run
@@ -303,20 +306,55 @@ CT 1053, hostname `ai-sandbox-gemini`.
 
 ### Writing a profile
 
-Until drop-in profiles land (PTF 5), a new agent is six functions in
-`ai-sandbox.sh`, named `profile_<agent>_<part>`:
+A new agent is one file on the host, `/root/.ai-sandbox/profiles/<agent>.sh`,
+that defines six functions named `profile_<agent>_<part>`. Nothing in
+`ai-sandbox.sh` changes: the file name is the agent name, and the agent
+shows up in `agents`, `up`, `status`, `bake` and the GUI hooks like the
+built-in ones.
 
 | Part | Job |
 | --- | --- |
 | `meta` | set `PROFILE_CTID`, `PROFILE_LABEL`, `PROFILE_VSCODE_EXT` |
 | `install` | print a bash snippet that installs the CLI (runs in the CT as root after the base toolchain; `/root/.local/bin` is on `PATH`) |
 | `verify` | print the command that proves the CLI works, e.g. `foo --version` |
-| `credentials` | push `$SECRETS_FILE` into the CT in the agent's native form (use `ct_push_file <src> <dest> <mode>`) |
+| `credentials` | push `$SECRETS_FILE` into the CT in the agent's native form (read values with `secrets_get NAME "$SECRETS_FILE"`; write with `ct_push_file <src> <dest> <mode>`, or pipe into `ct_run` so a key never lands on a command line) |
 | `policy` | write the default-deny config from `AGENT_CONNECTORS`, `AGENT_MCP`, `AGENT_AUTO_APPROVE` (use `bool_word on\|off` → `true\|false`) |
 | `credential_paths` | print the in-CT path(s) `credentials` writes, one per line; `bake` refuses to template an image where any of them exists |
 | `credentials_hint` | *optional*: tell the user how to create `secrets.env` when it is missing |
 
-The Mistral profile near the top of the script is the reference.
+The repo ships one example, [`examples/profiles/codex.sh`](examples/profiles/codex.sh)
+(OpenAI Codex CLI, CT 1054: npm install, `codex login --with-api-key`,
+and a `/etc/codex/requirements.toml` that forbids `never` approvals,
+`danger-full-access`, and MCP servers unless you turn them on). To use it:
+
+```bash
+install -D -o root -g root -m 644 examples/profiles/codex.sh /root/.ai-sandbox/profiles/codex.sh
+install -d -m 700 /root/.ai-sandbox/codex
+printf 'OPENAI_API_KEY=<key>\n' > /root/.ai-sandbox/codex/secrets.env
+chmod 600 /root/.ai-sandbox/codex/secrets.env
+/root/ai-sandbox.sh agents        # codex   CT 1054   OpenAI Codex CLI
+/root/ai-sandbox.sh up codex
+```
+
+A drop-in is sourced as root on every run, so the script checks it first,
+and refuses it (and stops) when:
+
+- the file or `/root/.ai-sandbox/profiles` is not owned by root, or is
+  group/other-writable (the same rule as `config.env`), or is a symlink;
+- the name is not a valid agent name (a lower-case letter, then up to
+  15 lower-case letters or digits; `golden` is reserved) or is a built-in
+  agent's;
+- it defines anything other than `profile_<agent>_*` functions, redefines
+  an existing function, or changes the script's own settings (`STATE_DIR`,
+  `FW_DIR`, `PATH`, …);
+- one of the six required parts is missing;
+- its `PROFILE_CTID` is not a number ≥ 100 or is already used by another
+  profile.
+
+A refused drop-in stops every command, GUI hooks included, so a bad file
+cannot start a CT half-configured; fix or remove it and the next run
+works. The built-in profiles near the top of `ai-sandbox.sh` are the
+reference for the helpers they use.
 
 ## Configuration
 
@@ -996,8 +1034,9 @@ Work is tracked as PTFs (fixes delivered as PRs):
    token (`claude setup-token`), managed-settings policy.
 4. **PTF 4 — Gemini CLI profile** *(done)*: AI Studio key, system
    settings policy, Node 22 for the npm package.
-5. **PTF 5 — drop-in profiles** for anything else, from
-   `/root/.ai-sandbox/profiles/`.
+5. **PTF 5 — drop-in profiles** *(done)*: any other agent as
+   `/root/.ai-sandbox/profiles/<agent>.sh`, checked before it is
+   sourced; Codex CLI as the shipped example.
 
 Decisions so far: parallel instances (one CT per agent from a shared
 golden template); both API keys and subscription tokens supported where

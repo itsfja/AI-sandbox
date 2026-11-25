@@ -628,6 +628,72 @@ rm -f "$T/state/gemini/secrets.env"; run FORCE=1 RESCUE=0 "$S" up gemini >/dev/n
 out="$(run "$S" export gemini 2>&1)"
 check "export suggests the Gemini VS Code companion" grep -q 'google.gemini-cli-vscode-ide-companion' <<<"$out"
 
+echo "== drop-in profiles (#12)"
+fresh
+PD="$T/state/profiles"
+EXAMPLE="$(cd "$HERE/../.." && pwd)/examples/profiles/codex.sh"
+check "the example profile ships with the repo" [ -f "$EXAMPLE" ]
+dropin() {   # $1 = name, stdin = content; installed root-owned 644 like the README says
+  mkdir -p "$PD"; chmod 755 "$PD"; cat > "$PD/$1.sh"; chmod 644 "$PD/$1.sh"
+}
+dropin codex < "$EXAMPLE"
+out="$(run "$S" agents 2>&1)"; rc=$?
+check_sh "the example codex drop-in loads: agents lists it with CT 1054" '[ $rc -eq 0 ] && grep -q "codex *CT 1054 *OpenAI Codex CLI" <<<"$out" && grep -q "mistral *CT 1051" <<<"$out"'
+mkdir -p "$T/state/codex"; printf 'OPENAI_API_KEY=sk-proj-TEST_key-123\n' > "$T/state/codex/secrets.env"; chmod 600 "$T/state/codex/secrets.env"
+: > "$T/calls.log"
+out="$(run "$S" up codex 2>&1)"; rc=$?
+check "up codex exits 0" [ $rc -eq 0 ]
+[ $rc -eq 0 ] || echo "$out" | tail -8
+check_sh "  ...own CT, npm install of @openai/codex, verify" 'grep -q "^hostname: ai-sandbox-codex$" "$T/conf/1054.conf" && grep -q "npm install -g --no-fund --no-audit @openai/codex" "$T/ct/1054/root/provision-base.sh" && [ "$(tail -n1 "$T/ct/1054/root/provision-base.sh")" = "codex --version" ]'
+check_sh "  ...logs in with the key on stdin, never on a command line" 'grep -q "lxc-attach -n 1054 .* codex login --with-api-key$" "$T/calls.log" && ! grep -q "sk-proj-TEST" "$T/calls.log"'
+# shellcheck disable=SC2034  # used inside check_sh strings
+R="$T/ct/1054/etc/codex/requirements.toml"
+check_sh "  ...requirements.toml (444): no never/danger-full-access, empty mcp_servers" '[ "$(stat -c %a "$R")" = 444 ] && python3 -c "import tomllib,sys; d=tomllib.load(open(sys.argv[1],\"rb\")); assert d[\"allowed_approval_policies\"]==[\"untrusted\",\"on-request\"] and d[\"allowed_sandbox_modes\"]==[\"read-only\",\"workspace-write\"] and d[\"mcp_servers\"]=={}" "$R"'
+out="$(run AGENT_MCP=on AGENT_AUTO_APPROVE=on FORCE=1 RESCUE=0 "$S" up codex 2>&1)"
+check_sh "  ...everything on: a valid TOML with no requirements" 'python3 -c "import tomllib,sys; assert tomllib.load(open(sys.argv[1],\"rb\"))=={}" "$R"'
+printf 'lvmthin: local-lvm\n\tthinpool data\n\tvgname pve\n' > "$T/storage.cfg"
+out="$(run STORAGE_CFG="$T/storage.cfg" "$S" bake 2>&1)"; rc=$?
+check_sh "bake includes the drop-in agent (BAKE_AGENTS=all)" '[ $rc -eq 0 ] && grep -q "agents=claude,codex,gemini,mistral$" "$T/state/golden/stamp" && grep -q "@openai/codex" "$T/ct/1048/root/provision-base.sh"'
+# --- refusals: each one stops the whole run, hooks included (fail closed)
+refused() {   # $1 = expected message (grep -E); runs `agents`
+  out="$(run "$S" agents 2>&1)"; rc=$?
+  [ $rc -ne 0 ] && grep -qE "$1" <<<"$out"
+}
+rm -f "$PD"/*.sh
+chmod 664 "$PD" 2>/dev/null; dropin ok </dev/null; chmod 775 "$PD"
+check "a group-writable profiles directory is refused" refused "refusing .*/profiles: group/other-writable"
+chmod 755 "$PD"; rm -f "$PD/ok.sh"
+dropin codex < "$EXAMPLE"; chmod 664 "$PD/codex.sh"
+check "a group-writable drop-in is refused" refused "refusing .*/codex.sh: group/other-writable"
+chmod 644 "$PD/codex.sh"; chown nobody "$PD/codex.sh"
+check "a drop-in not owned by root is refused" refused "refusing .*/codex.sh: not owned by root"
+rm -f "$PD/codex.sh"; ln -s "$EXAMPLE" "$PD/codex.sh"
+check "a symlinked drop-in is refused" refused "refusing drop-in profile .*/codex.sh: a symlink"
+rm -f "$PD/codex.sh"
+sed 's/profile_codex_/profile_Codex_/' "$EXAMPLE" | dropin Codex
+check "an invalid agent name is refused" refused "'Codex' is not a valid agent name"
+rm -f "$PD"/*.sh; dropin golden </dev/null
+check "'golden' is reserved" refused "'golden' is not a valid agent name"
+rm -f "$PD"/*.sh; sed 's/profile_codex_/profile_mistral_/' "$EXAMPLE" | dropin mistral
+check "a drop-in cannot replace a built-in agent" refused "agent 'mistral' already exists \(built-in\)"
+rm -f "$PD"/*.sh; { cat "$EXAMPLE"; echo 'guard_ct() { :; }'; } | dropin codex
+check "a drop-in that redefines a script function (guard_ct) is refused, naming it" refused "redefines existing function\(s\): guard_ct"
+rm -f "$PD"/*.sh; { cat "$EXAMPLE"; echo 'profile_mistral_policy() { :; }'; } | dropin codex
+check "...or another profile's function" refused "redefines existing function\(s\): profile_mistral_policy"
+rm -f "$PD"/*.sh; { cat "$EXAMPLE"; echo 'helper() { :; }'; } | dropin codex
+check "a function outside profile_<agent>_* is refused" refused "defines 'helper'; a drop-in may only define profile_codex_\* functions"
+rm -f "$PD"/*.sh; { cat "$EXAMPLE"; echo 'FW_DIR=/tmp/elsewhere'; } | dropin codex
+check "a drop-in that changes the script's paths is refused" refused "changes the script's own settings"
+rm -f "$PD"/*.sh; sed '/^profile_codex_credential_paths/d' "$EXAMPLE" | dropin codex
+check "a missing part is refused, naming it" refused "no profile_codex_credential_paths \(required: meta install verify credentials policy credential_paths\)"
+rm -f "$PD"/*.sh; sed 's/PROFILE_CTID=1054/PROFILE_CTID=1051/' "$EXAMPLE" | dropin codex
+check "a CTID another agent uses is refused, naming both" refused "profiles 'codex' and 'mistral' both use CT 1051|profiles 'mistral' and 'codex' both use CT 1051"
+out="$(gui_hook 1051 pre-start)"; rc=$?
+check_sh "  ...and a refused drop-in stops GUI hooks too (fail closed)" '[ $rc -ne 0 ] && grep -q "both use CT 1051" <<<"$out"'
+rm -f "$PD"/*.sh
+out="$(run "$S" agents 2>&1)"; rc=$?
+check_sh "with the bad drop-in removed, everything works again" '[ $rc -eq 0 ] && grep -q "mistral *CT 1051" <<<"$out"'
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]
