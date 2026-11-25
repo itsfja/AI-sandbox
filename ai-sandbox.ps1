@@ -160,7 +160,6 @@ Host $alias
     User root
     IdentityFile ~/.ssh/ai-sandbox
     IdentitiesOnly yes
-    LogLevel ERROR
     # disposable sandbox: every rebuild mints a FRESH host key; scoped to this alias only
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
